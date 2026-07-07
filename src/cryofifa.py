@@ -6,6 +6,7 @@ from new_dataloader import StarDataSet
 import numpy as np
 import math
 import contextlib
+import torch.utils.checkpoint
 import pandas as pd
 import sys
 from cam_module import *
@@ -56,6 +57,18 @@ np.set_printoptions(precision=4)
 def _bare(m):
   # unwrap DDP so we save/load the underlying module's weights
   return m.module if hasattr(m, 'module') else m
+
+
+def enc_fwd(model, x, args):
+  """Encoder forward with optional Tier-2 channels_last input + activation checkpointing.
+  channels_last: NHWC input so V100 conv tensor cores are faster (the model is also converted
+  to channels_last at construction). grad_checkpoint: recompute activations in backward to save
+  memory (only when training -- no benefit under eval/no-grad)."""
+  if args.channels_last:
+    x = x.contiguous(memory_format=torch.channels_last)
+  if args.grad_checkpoint and model.training:
+    return torch.utils.checkpoint.checkpoint(model, x, use_reentrant=False)
+  return model(x)
 
 
 def lr_at_epoch(epoch, base_lr, min_lr, total_epochs, warmup_epochs, use_warmup, schedule):
@@ -179,6 +192,8 @@ def main():
  
   Encoder_Feature_Extractor.apply(weight_init)
   Encoder_Feature_Extractor=Encoder_Feature_Extractor.to(device)
+  if args.channels_last:
+    Encoder_Feature_Extractor=Encoder_Feature_Extractor.to(memory_format=torch.channels_last)
   #***********FAIRSCALE MODEL CONFIG*****************#   
   # Encoder_Feature_Extractor_Optimer=OSS(params=Encoder_Feature_Extractor.parameters(),optim=base_optimizer,**base_optimizer_arguments)
   # Encoder_Feature_Extractor=ShardedDDP(Encoder_Feature_Extractor,Encoder_Feature_Extractor_Optimer)
@@ -193,6 +208,8 @@ def main():
   if args.downsample_train:
     Encoder_Feature_Extractor_Local = model_constructor(name='Feature_Extrator',backbone=args.encoder_backbone,basename=args.encoder_basename,in_channels=in_channels,image_size=imgsize,use_batchnorm=False)
     Encoder_Feature_Extractor_Local=Encoder_Feature_Extractor_Local.to(device)
+    if args.channels_last:
+      Encoder_Feature_Extractor_Local=Encoder_Feature_Extractor_Local.to(memory_format=torch.channels_last)
     Encoder_Feature_Extractor_Optimer_Local=optim.Adam(Encoder_Feature_Extractor_Local.parameters(),lr=lr*args.local_refine_scale)
     Encoder_Feature_Extractor_Local=DDP(Encoder_Feature_Extractor_Local,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
   if args.mode=='both':
@@ -453,19 +470,19 @@ def main():
             if current_reconstruct_radius>args.downsample_radius  :
               Encoder_Feature_Extractor.eval()
               Encoder_3D_Predictor.eval()       
-              features_local=Encoder_Feature_Extractor_Local(train_y) 
-              features=Encoder_Feature_Extractor(downsampled_train_y)        
+              features_local=enc_fwd(Encoder_Feature_Extractor_Local, train_y, args)
+              features=enc_fwd(Encoder_Feature_Extractor, downsampled_train_y, args)
             else:
               if args.random_input:
                 downsampled_train_noise=torch.rand_like(downsampled_train_y)
-                features=Encoder_Feature_Extractor(downsampled_train_noise)
-              else: 
-                features=Encoder_Feature_Extractor(downsampled_train_y)  
+                features=enc_fwd(Encoder_Feature_Extractor, downsampled_train_noise, args)
+              else:
+                features=enc_fwd(Encoder_Feature_Extractor, downsampled_train_y, args)
           else:
             if args.random_noise:
-              features=Encoder_Feature_Extractor(train_y+torch.randn_like(train_y)) 
+              features=enc_fwd(Encoder_Feature_Extractor, train_y+torch.randn_like(train_y), args)
             else:
-              features=Encoder_Feature_Extractor(train_y) 
+              features=enc_fwd(Encoder_Feature_Extractor, train_y, args)
 
           z_3d=Encoder_3D_Predictor(features) 
           if args.downsample_train and current_reconstruct_radius>args.downsample_radius :

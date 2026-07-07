@@ -381,6 +381,8 @@ def get_parser():
     parser.add_argument('--profile_iters',type=int,default=15,help='Number of iterations to profile when --profile is set.')
     parser.add_argument('--profile_epoch',type=int,default=0,help='Which epoch to run the profiler on.')
     parser.add_argument('--fast_ddp',action='store_true',default=False,help='Tier 1: DDP gradient_as_bucket_view=True + no_sync() during gradient accumulation (all-reduce once per optimizer step instead of every micro-step). Numerically identical, just less communication. Default off for exact reproducibility.')
+    parser.add_argument('--channels_last',action='store_true',default=False,help='Tier 2: run the ResNet encoder in channels_last (NHWC) memory format so V100 conv tensor cores are faster. Numerically identical (layout only). Targets the ~36%% conv time.')
+    parser.add_argument('--grad_checkpoint',action='store_true',default=False,help='Activation (gradient) checkpointing on the ResNet encoder: recompute activations in backward instead of storing them -> big cut in encoder-activation memory (~25-30%% more encoder compute). Frees memory so the dynamic minibatch can stay large. NOTE: not bit-identical because BN running stats are recomputed in backward.')
 
     #-------------------------
     args = parser.parse_args()

@@ -340,8 +340,10 @@ def main():
     # Tier 0: torch.profiler over the first --profile_iters iterations of --profile_epoch (rank 0 only).
     _prof = None; _prof_count = 0
     if args.profile and epoch == args.profile_epoch and local_rank == 0:
+      torch.cuda.reset_peak_memory_stats()
       _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                 torch.profiler.ProfilerActivity.CUDA])
+                                                 torch.profiler.ProfilerActivity.CUDA],
+                                     profile_memory=True)
       _prof.__enter__()
 
     current_reconstruct_radius=min(imgsize//2,min(args.mask_steps,(int(epoch/args.mask_epoch))*rescale_step+start_radius)*imgsize)
@@ -745,6 +747,13 @@ def main():
             _prof.__exit__(None, None, None)
             print("\n# ===== TIER-0 PROFILE  (top CUDA ops over %d iters) =====" % args.profile_iters, file=sys.stderr)
             print(_prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25), file=sys.stderr, flush=True)
+            print("\n# ===== TIER-0 MEMORY  (top ops by self CUDA memory) =====", file=sys.stderr)
+            try:
+              print(_prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=25), file=sys.stderr, flush=True)
+            except Exception as _me:
+              print("# memory table failed: %s" % _me, file=sys.stderr)
+            print("# peak CUDA mem this rank: %.2f GB (max_memory_allocated over the profiled window)"
+                  % (torch.cuda.max_memory_allocated() / 1e9), file=sys.stderr, flush=True)
             try:
               _trace = os.path.join(args.render_path, "profile_trace.json")
               _prof.export_chrome_trace(_trace)

@@ -1,0 +1,22 @@
+# large experiment outputs (multi-GB) — never commit
+experiments/results/
+experiments/LOG/
+*.mrc
+*.mrcs
+*.star
+
+# model checkpoints / traces
+*.pt
+*.pth
+profile_trace*.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# lmdb / data blobs
+*.lmdb
+*.mdb

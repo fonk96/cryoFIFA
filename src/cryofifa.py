@@ -71,6 +71,17 @@ def enc_fwd(model, x, args):
   return model(x)
 
 
+def dec_fwd(model, coords, latent, args):
+  """Decoder (SIREN) forward with optional activation checkpointing. The decoder is the memory
+  hog in the refine phase (it decodes ~pi*r^2 coords x sym at the large frontier and stores all
+  its mul/addmm activations); checkpointing it recomputes them in backward to save memory."""
+  if args.grad_checkpoint and model.training:
+    if latent is None:
+      return torch.utils.checkpoint.checkpoint(model, coords, use_reentrant=False)
+    return torch.utils.checkpoint.checkpoint(model, coords, latent, use_reentrant=False)
+  return model(coords) if latent is None else model(coords, latent)
+
+
 def lr_at_epoch(epoch, base_lr, min_lr, total_epochs, warmup_epochs, use_warmup, schedule):
   """Per-epoch LR. cosine decays base_lr->min_lr over [warmup, total], so the minimum is only
   reached at the end -- high-res shells that open late in frequency-marching are still learned.
@@ -525,7 +536,7 @@ def main():
               rotated_plane_grid=rotated_plane_grid[current_mask.expand(b,imgsize,imgsize)>0.49]   
               pred_images_3d=torch.zeros(b,imgsize,imgsize,2,device=device)              
 
-          decoder_output=Decoder_3D(rotated_plane_grid) if args.latent_code_dim_3d==0 else Decoder_3D(rotated_plane_grid,latent_3d)
+          decoder_output=dec_fwd(Decoder_3D, rotated_plane_grid, latent_3d if args.latent_code_dim_3d!=0 else None, args)
 
           if args.reduce_input:
             pred_images_3d[current_mask.expand(b,imgsize,imgsize)>0.49]=decoder_output.view(-1,2)  

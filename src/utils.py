@@ -376,6 +376,12 @@ def get_parser():
     # 5. Zero-mean/unit-variance-inside-mask normalization instead of global min-max.
     parser.add_argument('--norm_zscore',action='store_true',default=False,help='Normalize the output volume to zero-mean/unit-std computed inside the reconstruction mask, instead of global min-max (which lets one hot voxel set the scale).')
 
+    #------------- PERF: Tier 0 profiling + Tier 1 fast-DDP (added upgrade) -------------
+    parser.add_argument('--profile',action='store_true',default=False,help='Tier 0: run torch.profiler over --profile_iters iterations of --profile_epoch on rank 0, print the per-op CUDA-time table and dump a chrome trace to render_path, then continue training. Use to find the real bottleneck.')
+    parser.add_argument('--profile_iters',type=int,default=15,help='Number of iterations to profile when --profile is set.')
+    parser.add_argument('--profile_epoch',type=int,default=0,help='Which epoch to run the profiler on.')
+    parser.add_argument('--fast_ddp',action='store_true',default=False,help='Tier 1: DDP gradient_as_bucket_view=True + no_sync() during gradient accumulation (all-reduce once per optimizer step instead of every micro-step). Numerically identical, just less communication. Default off for exact reproducibility.')
+
     #-------------------------
     args = parser.parse_args()
     return args

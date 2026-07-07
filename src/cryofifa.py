@@ -5,6 +5,7 @@ from new_dataloader import StarDataSet
 
 import numpy as np
 import math
+import contextlib
 import pandas as pd
 import sys
 from cam_module import *
@@ -185,7 +186,7 @@ def main():
   Encoder_Feature_Extractor_Optimer=optim.Adam(Encoder_Feature_Extractor.parameters(),lr=lr)
 
 
-  Encoder_Feature_Extractor=DDP(Encoder_Feature_Extractor,device_ids=[local_rank])
+  Encoder_Feature_Extractor=DDP(Encoder_Feature_Extractor,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
 
 
 
@@ -193,7 +194,7 @@ def main():
     Encoder_Feature_Extractor_Local = model_constructor(name='Feature_Extrator',backbone=args.encoder_backbone,basename=args.encoder_basename,in_channels=in_channels,image_size=imgsize,use_batchnorm=False)
     Encoder_Feature_Extractor_Local=Encoder_Feature_Extractor_Local.to(device)
     Encoder_Feature_Extractor_Optimer_Local=optim.Adam(Encoder_Feature_Extractor_Local.parameters(),lr=lr*args.local_refine_scale)
-    Encoder_Feature_Extractor_Local=DDP(Encoder_Feature_Extractor_Local,device_ids=[local_rank])
+    Encoder_Feature_Extractor_Local=DDP(Encoder_Feature_Extractor_Local,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
   if args.mode=='both':
 
     Encoder_Feature_Extractor_3d = model_constructor(name='Feature_Extrator',backbone=args.encoder_backbone,basename=args.encoder_basename,in_channels=args.preprocessing_output_channels+1,image_size=imgsize,use_batchnorm=False)
@@ -202,7 +203,7 @@ def main():
     Encoder_Feature_Extractor_Optimer_3d=optim.Adam(Encoder_Feature_Extractor_3d.parameters(),lr=lr)
 
 
-    Encoder_Feature_Extractor_3d=DDP(Encoder_Feature_Extractor_3d,device_ids=[local_rank])
+    Encoder_Feature_Extractor_3d=DDP(Encoder_Feature_Extractor_3d,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
 
   if args.mode=='3d' or args.mode=='both':
     rotation_dim=6 
@@ -212,7 +213,7 @@ def main():
     Encoder_3D_Predictor=Encoder_3D_Predictor.to(device)  
     Encoder_3D_Predictor_Optimer=optim.Adam(Encoder_3D_Predictor.parameters(),lr=lr)
 
-    Encoder_3D_Predictor=DDP(Encoder_3D_Predictor,device_ids=[local_rank])
+    Encoder_3D_Predictor=DDP(Encoder_3D_Predictor,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
 
 
     if args.downsample_train:
@@ -223,7 +224,7 @@ def main():
       # refinement path is scaled consistently (was full lr -> inconsistent with efe_local).
       Encoder_3D_Predictor_Optimer_Local=optim.Adam(Encoder_3D_Predictor_Local.parameters(),lr=lr*args.local_refine_scale)
 
-      Encoder_3D_Predictor_Local=DDP(Encoder_3D_Predictor_Local,device_ids=[local_rank])
+      Encoder_3D_Predictor_Local=DDP(Encoder_3D_Predictor_Local,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
 
 
 
@@ -234,7 +235,7 @@ def main():
     # Decoder_3D_Optimer=OSS(params=Decoder_3D.parameters(),optim=base_optimizer,**base_optimizer_arguments)     
     # Decoder_3D=ShardedDDP(Decoder_3D,Decoder_3D_Optimer)
     Decoder_3D_Optimer=optim.Adam(Decoder_3D.parameters(),lr=lr)
-    Decoder_3D=DDP(Decoder_3D,device_ids=[local_rank])
+    Decoder_3D=DDP(Decoder_3D,device_ids=[local_rank],gradient_as_bucket_view=args.fast_ddp)
 
   #-------------constants----------------#
   # Constant grid used in phase_shift_ft function.  
@@ -335,6 +336,13 @@ def main():
     #loss_3d=0
     c=0
     N = len(sampler)
+
+    # Tier 0: torch.profiler over the first --profile_iters iterations of --profile_epoch (rank 0 only).
+    _prof = None; _prof_count = 0
+    if args.profile and epoch == args.profile_epoch and local_rank == 0:
+      _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                 torch.profiler.ProfilerActivity.CUDA])
+      _prof.__enter__()
 
     current_reconstruct_radius=min(imgsize//2,min(args.mask_steps,(int(epoch/args.mask_epoch))*rescale_step+start_radius)*imgsize)
 
@@ -670,9 +678,21 @@ def main():
               Decoder_3D_Optimer.zero_grad()    
 
 
-          scaler.scale(loss_3d).backward()
+          # Tier 1: skip DDP gradient all-reduce on non-final accumulation micro-steps.
+          # no_sync accumulates grads locally; the final micro-step (update_grad) all-reduces
+          # once. Mathematically identical to per-step sync, just far less communication.
+          if args.fast_ddp and not update_grad:
+            _ddp_models = [Encoder_Feature_Extractor, Encoder_3D_Predictor, Decoder_3D]
+            if args.downsample_train:
+              _ddp_models += [Encoder_Feature_Extractor_Local, Encoder_3D_Predictor_Local]
+            with contextlib.ExitStack() as _stack:
+              for _m in _ddp_models:
+                _stack.enter_context(_m.no_sync())
+              scaler.scale(loss_3d).backward()
+          else:
+            scaler.scale(loss_3d).backward()
 
-          if update_grad :  
+          if update_grad :
             if mode=='3d':
               if args.downsample_train:
                 if current_reconstruct_radius <  args.downsample_radius  : 
@@ -719,7 +739,20 @@ def main():
             template = '# [{}/{}] training {:.1%},  Error_2d={:.4f} ,  Error_3d={:.4f}' 
             line = template.format(epoch, num_epochs, c/N, loss_2d.item(),loss_3d.item())    
         print(line,"\r", end="", flush=True)
-    
+        if _prof is not None:
+          _prof_count += 1
+          if _prof_count >= args.profile_iters:
+            _prof.__exit__(None, None, None)
+            print("\n# ===== TIER-0 PROFILE  (top CUDA ops over %d iters) =====" % args.profile_iters, file=sys.stderr)
+            print(_prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25), file=sys.stderr, flush=True)
+            try:
+              _trace = os.path.join(args.render_path, "profile_trace.json")
+              _prof.export_chrome_trace(_trace)
+              print("# chrome trace -> %s" % _trace, file=sys.stderr, flush=True)
+            except Exception as _e:
+              print("# trace export failed: %s" % _e, file=sys.stderr, flush=True)
+            _prof = None
+
 
 
 

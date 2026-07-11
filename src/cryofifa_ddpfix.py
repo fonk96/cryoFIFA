@@ -1086,7 +1086,7 @@ def main():
           DL.write_file_apix(test_pred_images_3D,args.render_path+'/rec_3d_'+str(epoch+1)+'_'+str(int(eclipsed_time/60))+'min.mrc',data_apix)
 
           # ---- checkpoint (upgrade #1) ----
-          if args.save_checkpoint:
+          if args.save_checkpoint or args.checkpoint_interval > 0:
             _ckpt_int = args.checkpoint_interval if args.checkpoint_interval > 0 else args.save_interval
             if (epoch+1) % _ckpt_int == 0:
               save_checkpoint(os.path.join(args.render_path, 'checkpoint.pt'), epoch,

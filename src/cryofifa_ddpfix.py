@@ -228,7 +228,7 @@ def main():
 
   #=================data loader======================#
    
-  data_train,total_len,data_apix= data_constructor(args.data_path,args.particles_meta,imgsize,args.lmdb_path,with_name=args.save_pose,skip_pose=args.skip_read_pose)    
+  data_train,total_len,data_apix= data_constructor(args.data_path,args.particles_meta,imgsize,args.lmdb_path,with_name=(args.save_pose or args.pose_infer),skip_pose=args.skip_read_pose)
   # downsampled_data_train,total_len,donsampled_data_apix=data_constructor(args.data_path,args.particles_meta,imgsize,args.lmdb_path,downsample_train=args.downsample_train,downsample_imgsize=downsample_radius)
 
   sampler=DistributedSampler(data_train)
@@ -486,11 +486,16 @@ def main():
         Decoder_3D.train()
     else:
       if epoch <= args.lock_epoch:
-        Encoder_Feature_Extractor.train()     
+        Encoder_Feature_Extractor.train()
       else:
-        Encoder_Feature_Extractor.eval() 
-      Encoder_3D_Predictor.train()           
+        Encoder_Feature_Extractor.eval()
+      Encoder_3D_Predictor.train()
       Decoder_3D.train()
+    if args.pose_infer:
+      # inference: all encoders in eval so BN uses running stats -> pose is batch-order-independent
+      Encoder_Feature_Extractor.eval(); Encoder_3D_Predictor.eval()
+      if args.downsample_train:
+        Encoder_Feature_Extractor_Local.eval(); Encoder_3D_Predictor_Local.eval()
 
     current_mask=fourier_masks[mask_index]    
 
@@ -555,7 +560,7 @@ def main():
             train_y=torch_apply_lowpass(train_y,args.preprocessing_output_channels,pre_module)
             if args.downsample_train:
               downsampled_train_y=torch_apply_lowpass(downsampled_train_y,args.preprocessing_output_channels,downsampled_pre_module)
-          if args.sym:
+          if args.sym and not args.pose_infer:
             degrees=np.random.rand(args.sym_factor)*360 if args.random_augmentation else []
             #print(train_y.size())
             train_y=image_duplicator(train_y,args.sym_factor,args.rot_manner,degrees)
@@ -609,7 +614,23 @@ def main():
           #center_plane_grid_triu=torch.triu(center_plane_grid.view(imgsize,imgsize,3))
           center_plane_grid =  center_plane_grid.expand(b,center_plane_grid.size(0),center_plane_grid.size(1))
           norm_rotation_3d=sixd_to_two_orthonormal(rotation_3d)
-          if args.norm6d:            
+          if args.pose_infer:
+            # STAGE-2: forward-only copy-0 pose export for the ORIGINAL particles (sym skipped above,
+            # disturbance off at this epoch). Same star format as --save_pose; then skip decode/loss/step.
+            _pf=os.path.join(args.render_path, args.output_pose_file+'_infer_rank%d.star'%rank)
+            _new_pf=not os.path.exists(_pf)
+            _fh=open(_pf,'a+')
+            if _new_pf:
+              _fh.write('data_particles\n\nloop_\n_rlnImageName #1\n_rlnAngleRot #2\n_rlnAngleTilt #3\n_rlnAnglePsi #4\n_rlnDefocusU #5\n_rlnDefocusV #6\n_rlnDefocusAngle #7\n_rlnVoltage #8\n_rlnSphericalAberration #9\n_rlnAmplitudeContrast #10\n_rlnOriginX #11\n_rlnOriginY #12\n_rlnImagePixelSize #13\n_rlnrotation6d #14\n_rlnnorm6d\n')
+            _eul=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d.float()).cpu().detach().numpy()).as_euler('zyz', degrees=True)
+            _tr=translation_3d.cpu().detach().numpy()
+            _r6=np.round(rotation_3d.cpu().detach().float().numpy(),5)
+            _n6=np.round(norm_rotation_3d.cpu().detach().float().numpy(),5)
+            for _i in range(len(particles_name)):
+              _fh.write(particles_name[_i]+' '+str(_eul[_i][0])+' '+str(_eul[_i][1])+' '+str(_eul[_i][2])+' '+str(ctf_params['dfu'][_i].numpy())+' '+str(ctf_params['dfv'][_i].numpy())+' '+str(ctf_params['dfang'][_i].numpy())+' '+str(ctf_params['volt'][_i].numpy())+' '+str(ctf_params['cs'][_i].numpy())+' '+str(ctf_params['ampcont'][_i].numpy())+' '+str(_tr[_i][0])+' '+str(_tr[_i][1])+' '+str(ctf_params['apix'][_i].numpy())+' '+str(_r6[_i])+' '+str(_n6[_i])+'  \n')
+            _fh.close()
+            continue
+          if args.norm6d:
             rot_3d_matrix=transforms.rotation_6d_to_matrix(norm_rotation_3d)
           else:
             rot_3d_matrix=transforms.rotation_6d_to_matrix(rotation_3d)    
@@ -943,8 +964,13 @@ def main():
             except Exception as _e:
               print("# trace export failed: %s" % _e, file=sys.stderr, flush=True)
             _prof = None
+    if args.pose_infer:
+      # one full data pass done -> all ranks wrote their pose shard; sync and exit (no render/checkpoint).
+      distr.barrier(group=sync_pg)
+      print('# pose_infer done: poses -> %s (%s_infer_rank*.star)' % (args.render_path, args.output_pose_file), file=sys.stderr, flush=True)
+      sys.exit(0)
     current_free_mem = get_global_min_free_mem_gb(device)
-    torch.cuda.empty_cache()          
+    torch.cuda.empty_cache()
 
     if (epoch+1)%args.save_interval==0:
 

@@ -352,6 +352,7 @@ def get_parser():
     parser.add_argument('--checkpoint_path',type=str,default='')
     parser.add_argument('--resume',type=str,default='',help='Path to a checkpoint.pt to resume {models,optimizers,scaler,epoch} from. Empty = fresh start.')
     parser.add_argument('--checkpoint_interval',type=int,default=0,help='Save a checkpoint every N epochs. 0 = use --save-interval (i.e. save whenever a volume is rendered).')
+    parser.add_argument('--seed',type=int,default=-1,help='Fixed RNG seed (>=0) for reproducible ab-initio runs (same basin each run). -1 = seedless (default).')
 
     #-------------VOLUME REGULARIZATION / OUTPUT OPTIONS (added upgrade)-------------
     # 2. Soft-edge (raised-cosine) masks instead of hard binary spheres -> kill Gibbs ringing.

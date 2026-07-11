@@ -210,6 +210,17 @@ def main():
     timeout=datetime.timedelta(hours=12),
   )
 
+  # Reproducibility: seed all RNGs so the ab-initio pose search doesn't roll a different (possibly
+  # orientation-collapsed / blobby) basin every run. Per-rank offset decorrelates the 8 GPUs' streams
+  # while staying deterministic given (seed, world_size). cudnn is left non-deterministic to keep V100
+  # conv speed -- the basin is fixed by the EARLY pose search (model init + disturbance), which the seed
+  # pins; the DistributedSampler is already deterministic (default seed 0 + set_epoch).
+  if args.seed >= 0:
+    import random as _random
+    _s = args.seed + local_rank
+    torch.manual_seed(_s); torch.cuda.manual_seed_all(_s)
+    np.random.seed(_s); _random.seed(_s)
+
   #======================================#
   if not os.path.exists(args.render_path) and (local_rank==0):
     os.mkdir(args.render_path)

@@ -383,6 +383,9 @@ def get_parser():
     parser.add_argument('--fast_ddp',action='store_true',default=False,help='Tier 1: DDP gradient_as_bucket_view=True + no_sync() during gradient accumulation (all-reduce once per optimizer step instead of every micro-step). Numerically identical, just less communication. Default off for exact reproducibility.')
     parser.add_argument('--channels_last',action='store_true',default=False,help='Tier 2: run the ResNet encoder in channels_last (NHWC) memory format so V100 conv tensor cores are faster. Numerically identical (layout only). Targets the ~36%% conv time.')
     parser.add_argument('--grad_checkpoint',action='store_true',default=False,help='Activation (gradient) checkpointing on the ResNet encoder: recompute activations in backward instead of storing them -> big cut in encoder-activation memory (~25-30%% more encoder compute). Frees memory so the dynamic minibatch can stay large. NOTE: not bit-identical because BN running stats are recomputed in backward.')
+    parser.add_argument('--cascade_refine',action='store_true',default=False,help='Option-B conditioned cascade: a zero-init PoseRefiner sees the render-and-compare residual (y - pred@coarse-pose) and predicts a small so(3)+shift update; the volume is then re-rendered at the refined pose. Amortised Newton step -> refines pose without per-particle optimisation. Default off (byte-identical when absent).')
+    parser.add_argument('--cascade_lambda',type=float,default=0.0,help='Weight of an auxiliary loss on the COARSE render (pred@coarse-pose), so the coarse head keeps direct gradient. 0 = only the refined render is in the loss.')
+    parser.add_argument('--cascade_shift_scale',type=float,default=1.0,help='Scale (in pixels) on the refiner shift residual dt.')
 
     #-------------------------
     args = parser.parse_args()

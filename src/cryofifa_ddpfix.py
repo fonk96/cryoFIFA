@@ -93,6 +93,26 @@ def dec_fwd(model, coords, latent, args):
   return model(coords) if latent is None else model(coords, latent)
 
 
+class PoseRefiner(nn.Module):
+  """Option-B conditioned-cascade pose refiner. Takes the render-and-compare RESIDUAL image
+  [b,1,H,W] = ift2(y - pred@coarse_pose) and outputs a SMALL pose update (dw in so(3) tangent,
+  dt in pixels). The final Linear is zero-initialised so it starts as the identity map (no
+  correction) -> a natural warm start; it then learns the amortised Newton step
+  (data-model residual -> pose update)."""
+  def __init__(self, in_ch=1):
+    super(PoseRefiner, self).__init__()
+    self.net = nn.Sequential(
+        nn.Conv2d(in_ch, 16, 5, 2, 2), nn.ReLU(inplace=True),
+        nn.Conv2d(16, 32, 5, 2, 2),    nn.ReLU(inplace=True),
+        nn.Conv2d(32, 64, 5, 2, 2),    nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool2d(1), nn.Flatten())
+    self.head = nn.Linear(64, 5)
+    nn.init.zeros_(self.head.weight)
+    nn.init.zeros_(self.head.bias)
+  def forward(self, x):
+    return self.head(self.net(x))
+
+
 def lr_at_epoch(epoch, base_lr, min_lr, total_epochs, warmup_epochs, use_warmup, schedule):
   """Per-epoch LR. cosine decays base_lr->min_lr over [warmup, total], so the minimum is only
   reached at the end -- high-res shells that open late in frequency-marching are still learned.
@@ -302,6 +322,12 @@ def main():
     # Decoder_3D=ShardedDDP(Decoder_3D,Decoder_3D_Optimer)
     Decoder_3D_Optimer=optim.Adam(Decoder_3D.parameters(),lr=lr)
     Decoder_3D = ddp_wrap(Decoder_3D, local_rank, args)
+    if args.cascade_refine:
+      Pose_Refiner = PoseRefiner().to(device)
+      if args.channels_last:
+        Pose_Refiner = Pose_Refiner.to(memory_format=torch.channels_last)
+      Pose_Refiner_Optimer = optim.Adam(Pose_Refiner.parameters(), lr=lr)
+      Pose_Refiner = ddp_wrap(Pose_Refiner, local_rank, args)
   #-------------constants----------------#
   # Constant grid used in phase_shift_ft function.  
   helper_x,helper_y=torch.meshgrid(torch.arange(-imgsize/2,imgsize/2),torch.arange(-imgsize/2,imgsize/2))
@@ -337,6 +363,9 @@ def main():
     checkpoint_models['e3dp_local'] = Encoder_3D_Predictor_Local
     checkpoint_optimizers['efe_local'] = Encoder_Feature_Extractor_Optimer_Local
     checkpoint_optimizers['e3dp_local'] = Encoder_3D_Predictor_Optimer_Local
+  if args.cascade_refine:
+    checkpoint_models['refiner'] = Pose_Refiner
+    checkpoint_optimizers['refiner'] = Pose_Refiner_Optimer
 
   start_epoch = 0
   if args.resume:
@@ -395,6 +424,9 @@ def main():
                            args.lr_warmup_epochs, args.lr_warmup, args.lr_schedule)
       for _opt in [Encoder_Feature_Extractor_Optimer, Encoder_3D_Predictor_Optimer, Decoder_3D_Optimer]:
         for _pg in _opt.param_groups:
+          _pg['lr'] = cur_lr
+      if args.cascade_refine:
+        for _pg in Pose_Refiner_Optimer.param_groups:
           _pg['lr'] = cur_lr
       if args.downsample_train:
         # warm restart: treat the local stage as its own run starting at fade_in_start_epoch
@@ -635,6 +667,52 @@ def main():
           y_ft=torch.mul(y_ft,current_mask)
 
           pred_images_3d=torch.mul(pred_images_3d,current_mask)
+
+          # ---- Option-B conditioned cascade: render-and-compare pose refinement (K=1) ----
+          # pred_images_3d above is the COARSE render (at rot_3d_matrix, translation_3d), already
+          # masked. The residual (y - pred@coarse) directly encodes the pose error; a zero-init
+          # refiner predicts a small so(3)+shift update; re-render at the refined pose.
+          cascade_aux_loss = None
+          if args.cascade_refine:
+            def _render(_R, _t):
+              _grid = torch.bmm(center_plane_grid, _R.transpose(1,2)).view(b,imgsize,imgsize,3)
+              if args.reduce_input:
+                _sel = current_mask.expand(b,imgsize,imgsize) > 0.49
+                _dec = dec_fwd(Decoder_3D, _grid[_sel], latent_3d if args.latent_code_dim_3d!=0 else None, args)
+                _p = torch.zeros(b,imgsize,imgsize,2,device=device)
+                _p[_sel] = _dec.view(-1,2)
+              else:
+                _p = dec_fwd(Decoder_3D, _grid, latent_3d if args.latent_code_dim_3d!=0 else None, args)
+              _p = torch.view_as_complex(_p)
+              _p = phase_shift_ft(_p, _t, helper_x, helper_y)
+              if volume_prior_weight_map is not None:
+                _prr = _p.real.float(); _pii = _p.imag.float()
+                _vp = args.volume_prior_weight * torch.mean(volume_prior_weight_map*(_prr*_prr+_pii*_pii))
+              else:
+                _vp = None
+              _p = ft2(torch.mul(ift2(_p), reconstruct_mask))
+              _p = torch.mul(_p, ctf.view(b,imgsize,imgsize))
+              _p = torch.mul(_p, current_mask)
+              return _p, _vp
+            # detach: the refiner treats the residual as a FIXED observed error (a learned
+            # optimizer step reads the residual, it doesn't backprop through the coarse render).
+            # Also avoids the DDP "mark ready twice" error from Decoder_3D getting grad from both
+            # the coarse and refined decode (with --cascade_lambda 0 the decoder is then in the graph
+            # only via the refined render). NOTE: --cascade_lambda>0 needs ddp_wrap find_unused_parameters=True.
+            _resid_img = ift2(y_ft - pred_images_3d.detach()).real.view(b,1,imgsize,imgsize)
+            if args.channels_last:
+              _resid_img = _resid_img.contiguous(memory_format=torch.channels_last)
+            _dp = Pose_Refiner(_resid_img)
+            _dw = _dp[:, :3].float()
+            _dt = _dp[:, 3:5]
+            _dR = transforms.axis_angle_to_matrix(_dw).to(rot_3d_matrix.dtype)
+            _R1 = torch.bmm(_dR, rot_3d_matrix)
+            _t1 = translation_3d + _dt * args.cascade_shift_scale
+            if args.cascade_lambda > 0:
+              _cl, _ = symmetric_complex_loss(pred_images_3d, y_ft, args.sym_factor)
+              cascade_aux_loss = args.cascade_lambda * _cl.mean()
+            pred_images_3d, volume_prior_loss = _render(_R1, _t1)
+
           # noise grad could be seen as weighted on different resolution.
           # test no noise_grad,this make loss larger
           # 
@@ -719,6 +797,8 @@ def main():
             loss_3d=torch.add(loss_3d,torch.div(rot_uniform_loss,accum_iter))  # scale by accum_iter like the data term + volume prior (was accum_iter x too strong)
           if volume_prior_loss is not None:
             loss_3d=torch.add(loss_3d, torch.div(volume_prior_loss, accum_iter))
+          if cascade_aux_loss is not None:
+            loss_3d=torch.add(loss_3d, torch.div(cascade_aux_loss, accum_iter))  # optional aux loss on the coarse render (--cascade_lambda)
 
 
           if trunk_size*current_trunk>=args.batch_size:
@@ -731,6 +811,8 @@ def main():
             update_grad=False
 
           if mode=='3d' :
+            if args.cascade_refine:
+              Pose_Refiner_Optimer.zero_grad()
             if args.downsample_train :
              
               #if epoch <  args.downsample_train_epoch  :
@@ -764,6 +846,8 @@ def main():
             _ddp_models = [Encoder_Feature_Extractor, Encoder_3D_Predictor, Decoder_3D]
             if args.downsample_train:
               _ddp_models += [Encoder_Feature_Extractor_Local, Encoder_3D_Predictor_Local]
+            if args.cascade_refine:
+              _ddp_models += [Pose_Refiner]
             with contextlib.ExitStack() as _stack:
               for _m in _ddp_models:
                 _stack.enter_context(_m.no_sync())
@@ -796,6 +880,8 @@ def main():
                 scaler.step(Decoder_3D_Optimer)
             # else:
             #   scaler.step(Encoder_Feature_Extractor_Optimer_3d)
+            if args.cascade_refine:
+              scaler.step(Pose_Refiner_Optimer)
 
             scaler.update()
 

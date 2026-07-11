@@ -758,10 +758,18 @@ def main():
             if newfile_marker:
               output_pose_file.write(pre_append)
             #predicted_pose_euler=transforms.matrix_to_euler_angles(transforms.rotation_6d_to_matrix(rotation_3d[active_path]),'ZYZ')
+            # Export the COPY-0 block (the original, un-augmented image), NOT active_path.
+            # image_duplicator stacks {orig, rot90, rot180, rot270, +mirrors} along dim0, so the first
+            # n_orig rows are the original images. active_path selects the winning augmented copy, whose
+            # pose carries that copy's discrete 90-deg in-plane rotation (and a MIRROR for copies 4-7) --
+            # and it was also inconsistent with the shift/rot6d columns below, which already use [:n_orig].
+            # Copy-0's pose is the encoder's direct amortized prediction for the real image: clean and
+            # consistent across all columns. Convention vs RELION/cryoSPARC still needs calibration (see notes).
+            n_orig=len(particles_name)
             if args.norm6d:
-              temp_r=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d[active_path]).cpu().detach().numpy())
+              temp_r=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d[:n_orig]).cpu().detach().numpy())
             else:
-              temp_r=Rotation.from_matrix(transforms.rotation_6d_to_matrix(rotation_3d[active_path]).cpu().detach().numpy())
+              temp_r=Rotation.from_matrix(transforms.rotation_6d_to_matrix(rotation_3d[:n_orig]).cpu().detach().numpy())
             predicted_pose_euler=temp_r.as_euler('zyz', degrees=True)
 
 

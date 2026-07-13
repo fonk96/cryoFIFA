@@ -103,5 +103,10 @@ for c in range(8):
     sel=copies==c
     print(f"  copy {c} (n={sel.sum():5d}): median={np.median(res[sel]):5.2f}deg")
 print(f"OVERALL: median={np.median(res):.2f}  mean={res.mean():.2f}  <5deg={100*np.mean(res<5):.1f}%  <10deg={100*np.mean(res<10):.1f}%")
-np.savez(sys.argv[3], res=res, view=view, copies=copies)
+# Save eulers in cryoSPARC's NATIVE frame so half1/half2/cryoSPARC distributions are all comparable.
+def eul(M): return R.from_matrix(M).as_euler('ZYZ',degrees=True)   # [N,3]=rot,tilt,psi
+Rcfcs=np.einsum('ij,njk->nik',Rg.T,Rcf)                            # cryoFIFA pose in cryoSPARC frame
+np.savez(sys.argv[3], res=res, copies=copies,
+         cf_eul_cs=eul(Rcfcs), cs_eul_native=csang,                # both in cryoSPARC native frame
+         cf_eul=eul(Rcf), cs_eul=eul(Rcs))
 print("saved",sys.argv[3])

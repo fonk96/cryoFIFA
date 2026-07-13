@@ -6,7 +6,7 @@ ROOT=/sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA
 cd $ROOT/experiments
 mkdir -p LOG
 CSPROJ=/sddn/kongfang_work/YANG/Projects/CS-yang/
-for TAG in 005 01 02 03 04 05; do
+for TAG in 005 01 02 03 04; do
   echo "===== SNR $TAG start ====="
   # 1) lmdb (skip if present)
   if [ ! -f /data/lmdb/ribo_snr${TAG}/data.mdb ]; then

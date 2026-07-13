@@ -3,7 +3,7 @@
 for c in /sddn/kongfang_work/pkgs/miniconda3 ~/miniconda3; do [ -f $c/etc/profile.d/conda.sh ] && source $c/etc/profile.d/conda.sh && break; done
 conda activate cryofifa
 cd /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments
-for TAG in 005 01 02 03 04 05; do
+for TAG in 005 01 02 03 04; do
   P=results/2026_Jul_06/ribo_snr${TAG}_poses/temp_pose_infer_rank0.star
   n=0
   while [ ! -f "$P" ] && [ $n -lt 400 ]; do sleep 45; n=$((n+1)); done

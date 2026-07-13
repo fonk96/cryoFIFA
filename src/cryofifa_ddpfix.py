@@ -385,6 +385,8 @@ def main():
       print('# resumed from %s -> starting at epoch %d' % (args.resume, start_epoch), file=sys.stderr)
     else:
       print('# --resume given but file not found: %s (starting fresh)' % args.resume, file=sys.stderr)
+  if args.pose_infer:
+    torch.set_grad_enabled(False)   # inference only: no backward -> saves memory for the 8x sym render
 
   #------------- Gaussian spectral (volume) prior: radial frequency weight (upgrade #3) -------------
   # |k|/k_Nyquist in [0,1] for a centered 2D Fourier slice; DC at the box centre.
@@ -492,10 +494,14 @@ def main():
       Encoder_3D_Predictor.train()
       Decoder_3D.train()
     if args.pose_infer:
-      # inference: all encoders in eval so BN uses running stats -> pose is batch-order-independent
+      # Match TRAINING refine-regime BN modes EXACTLY. Global encoders were eval during refine (set above,
+      # running stats reliable). The LOCAL encoders were NEVER eval'd in training -> they ran in train mode
+      # with batch-BN, so their running stats are unreliable; forcing them to eval corrupts the local pose
+      # correction and scrambles the exported poses. Keep locals in train mode (batch-BN) to reproduce
+      # the map-generating poses.
       Encoder_Feature_Extractor.eval(); Encoder_3D_Predictor.eval()
       if args.downsample_train:
-        Encoder_Feature_Extractor_Local.eval(); Encoder_3D_Predictor_Local.eval()
+        Encoder_Feature_Extractor_Local.train(); Encoder_3D_Predictor_Local.train()
 
     current_mask=fourier_masks[mask_index]    
 
@@ -560,7 +566,7 @@ def main():
             train_y=torch_apply_lowpass(train_y,args.preprocessing_output_channels,pre_module)
             if args.downsample_train:
               downsampled_train_y=torch_apply_lowpass(downsampled_train_y,args.preprocessing_output_channels,downsampled_pre_module)
-          if args.sym and not args.pose_infer:
+          if args.sym:
             degrees=np.random.rand(args.sym_factor)*360 if args.random_augmentation else []
             #print(train_y.size())
             train_y=image_duplicator(train_y,args.sym_factor,args.rot_manner,degrees)
@@ -614,22 +620,6 @@ def main():
           #center_plane_grid_triu=torch.triu(center_plane_grid.view(imgsize,imgsize,3))
           center_plane_grid =  center_plane_grid.expand(b,center_plane_grid.size(0),center_plane_grid.size(1))
           norm_rotation_3d=sixd_to_two_orthonormal(rotation_3d)
-          if args.pose_infer:
-            # STAGE-2: forward-only copy-0 pose export for the ORIGINAL particles (sym skipped above,
-            # disturbance off at this epoch). Same star format as --save_pose; then skip decode/loss/step.
-            _pf=os.path.join(args.render_path, args.output_pose_file+'_infer_rank%d.star'%rank)
-            _new_pf=not os.path.exists(_pf)
-            _fh=open(_pf,'a+')
-            if _new_pf:
-              _fh.write('data_particles\n\nloop_\n_rlnImageName #1\n_rlnAngleRot #2\n_rlnAngleTilt #3\n_rlnAnglePsi #4\n_rlnDefocusU #5\n_rlnDefocusV #6\n_rlnDefocusAngle #7\n_rlnVoltage #8\n_rlnSphericalAberration #9\n_rlnAmplitudeContrast #10\n_rlnOriginX #11\n_rlnOriginY #12\n_rlnImagePixelSize #13\n_rlnrotation6d #14\n_rlnnorm6d\n')
-            _eul=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d.float()).cpu().detach().numpy()).as_euler('zyz', degrees=True)
-            _tr=translation_3d.cpu().detach().numpy()
-            _r6=np.round(rotation_3d.cpu().detach().float().numpy(),5)
-            _n6=np.round(norm_rotation_3d.cpu().detach().float().numpy(),5)
-            for _i in range(len(particles_name)):
-              _fh.write(particles_name[_i]+' '+str(_eul[_i][0])+' '+str(_eul[_i][1])+' '+str(_eul[_i][2])+' '+str(ctf_params['dfu'][_i].numpy())+' '+str(ctf_params['dfv'][_i].numpy())+' '+str(ctf_params['dfang'][_i].numpy())+' '+str(ctf_params['volt'][_i].numpy())+' '+str(ctf_params['cs'][_i].numpy())+' '+str(ctf_params['ampcont'][_i].numpy())+' '+str(_tr[_i][0])+' '+str(_tr[_i][1])+' '+str(ctf_params['apix'][_i].numpy())+' '+str(_r6[_i])+' '+str(_n6[_i])+'  \n')
-            _fh.close()
-            continue
           if args.norm6d:
             rot_3d_matrix=transforms.rotation_6d_to_matrix(norm_rotation_3d)
           else:
@@ -778,6 +768,26 @@ def main():
               loss_3d,active_path= symmetric_complex_L1_loss(pred_images_3d,y_ft,args.sym_factor)
             else:
               loss_3d,active_path= symmetric_complex_loss(pred_images_3d,y_ft,args.sym_factor)
+
+          if args.pose_infer:
+            # BEST-OF-8 export: active_path[p] in {0..sym-1} is the winning in-plane sym copy for
+            # particle p (the pose the reconstruction actually used). Batch layout is [copy][particle]
+            # (copy outer, image_duplicator cat), so the winner's flat row = copy*n_orig + p. Export the
+            # winning euler + its copy index (col14); the 90deg/flip undo is resolved in pose_compare.
+            n_orig=len(particles_name)
+            _flat=(active_path.long()*n_orig + torch.arange(n_orig,device=active_path.device))
+            _eul=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d[_flat].float()).cpu().detach().numpy()).as_euler('zyz', degrees=True)
+            _cpy=active_path.long().cpu().detach().numpy()
+            _tr=translation_3d[_flat].cpu().detach().numpy()
+            _pf=os.path.join(args.render_path, args.output_pose_file+'_infer_rank%d.star'%rank)
+            _new_pf=not os.path.exists(_pf)
+            _fh=open(_pf,'a+')
+            if _new_pf:
+              _fh.write('data_particles\n\nloop_\n_rlnImageName #1\n_rlnAngleRot #2\n_rlnAngleTilt #3\n_rlnAnglePsi #4\n_rlnDefocusU #5\n_rlnDefocusV #6\n_rlnDefocusAngle #7\n_rlnVoltage #8\n_rlnSphericalAberration #9\n_rlnAmplitudeContrast #10\n_rlnOriginX #11\n_rlnOriginY #12\n_rlnImagePixelSize #13\n_rlnSymCopy #14\n')
+            for _i in range(n_orig):
+              _fh.write(particles_name[_i]+' '+str(_eul[_i][0])+' '+str(_eul[_i][1])+' '+str(_eul[_i][2])+' '+str(ctf_params['dfu'][_i].numpy())+' '+str(ctf_params['dfv'][_i].numpy())+' '+str(ctf_params['dfang'][_i].numpy())+' '+str(ctf_params['volt'][_i].numpy())+' '+str(ctf_params['cs'][_i].numpy())+' '+str(ctf_params['ampcont'][_i].numpy())+' '+str(_tr[_i][0])+' '+str(_tr[_i][1])+' '+str(ctf_params['apix'][_i].numpy())+' '+str(int(_cpy[_i]))+'  \n')
+            _fh.close()
+            continue
 
           if args.save_pose and (epoch+1)%args.save_interval==0 :
             newfile_marker=False

@@ -58,27 +58,33 @@ def parse_fifa(paths):
 
 
 def parse_relion(path):
-    """Standard RELION loop_ star -> (colmap, list-of-rows)."""
+    """RELION star, handles multi-block (RELION-3.1 data_optics + data_particles): returns the
+    (colmap, rows) of the block that carries the pose (the one with _rlnAngleRot)."""
     colmap, rows = {}, []
+    cur = {}
     with open(path) as fh:
         for line in fh:
             s = line.strip()
             if not s or s.startswith('#'):
                 continue
-            if s.startswith('_rln'):
+            if s.startswith('data_'):
+                cur = {}                          # new block -> reset column map
+                continue
+            if s.startswith('loop_'):
+                continue
+            if s.startswith('_'):
                 tok = s.split()
-                name = tok[0]
-                idx = int(tok[1][1:]) - 1 if len(tok) > 1 and tok[1].startswith('#') else len(colmap)
-                colmap[name] = idx
+                idx = int(tok[1][1:]) - 1 if len(tok) > 1 and tok[1].startswith('#') else len(cur)
+                cur[tok[0]] = idx
                 continue
-            if s.startswith('data') or s.startswith('loop') or s.startswith('_'):
-                continue
-            tok = s.split()
-            if len(tok) >= len(colmap) and colmap:
-                rows.append(tok)
+            if '_rlnAngleRot' in cur:             # data row of the particles block
+                tok = s.split()
+                if len(tok) >= len(cur):
+                    rows.append(tok)
+                    colmap = cur
     if not colmap:
-        sys.exit(f"no _rln columns found in {path}")
-    print(f"[cs]   columns: {sorted(colmap, key=colmap.get)}")
+        sys.exit(f"no particles block (with _rlnAngleRot) found in {path}")
+    print(f"[cs]   particle columns: {sorted(colmap, key=colmap.get)}")
     print(f"[cs]   {len(rows)} rows")
     return colmap, rows
 

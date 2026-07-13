@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-export_star_for_cryosparc.py -- convert cryoFIFA best-of-8 poses to a RELION-3.1 star that cryoSPARC
-can import and 'reconstruct only'. Expresses the winning (undone) pose in cryoSPARC's own frame/
-convention (Rcf_cs = Rg^T Rcf, angles = as_euler('ZYZ'), same as the J68 star cryoSPARC produced), so
-both halves share one frame (combinable, gold-standard). Shift is the winning translation with the
-per-copy 90deg/flip undone + RELION sign; verify/refine shifts in cryoSPARC if the map looks soft.
+export_star_for_cryosparc.py -- cryoFIFA best-of-8 poses -> RELION-3.1 star for cryoSPARC import + reconstruct.
+Poses in cryoSPARC frame (Rcf_cs=Rg^T Rcf). Per-copy shift conversion is FIT to cryoSPARC (best possible),
+since cryoFIFA's raw shift head is only ~0.3-correlated; translation_3d is already in pixels (phase_shift
+uses dx/img_size). Shift mode via argv[4]: 'fit' (data-driven best) or 'zero' (extraction centers).
 
-  python export_star_for_cryosparc.py <cs_J68.star> <out.star> <fifa_h1_glob> [<fifa_h2_glob>]
+  python export_star_for_cryosparc.py <cs_J68.star> <out.star> <fit|zero> <fifa_h1_glob> [<fifa_h2_glob>]
 """
 import sys, glob, os, re
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 Mz=np.diag([1.,1,-1])
-
 def norm_keys(name):
     keys=[name]
     if '@' in name:
@@ -31,8 +29,7 @@ def geo(A,B):
 def nearest(M):
     U,_,Vt=np.linalg.svd(M); d=np.sign(np.linalg.det(U@Vt)); return U@np.diag([1,1,d])@Vt
 
-cs_path, out_path = sys.argv[1], sys.argv[2]
-# parse J68 particles block
+cs_path, out_path, shift_mode = sys.argv[1], sys.argv[2], sys.argv[3]
 cur={};cols={};rows=[]
 for ln in open(cs_path):
     s=ln.strip()
@@ -48,12 +45,10 @@ csidx={}
 for r in rows:
     for k in norm_keys(r[cols['_rlnImageName']]): csidx.setdefault(k,r)
 CR,CT,CP=cols['_rlnAngleRot'],cols['_rlnAngleTilt'],cols['_rlnAnglePsi']
-
-def R2(deg):
-    t=np.radians(deg); c,s=np.cos(t),np.sin(t); return np.array([[c,-s],[s,c]])
+OX,OY=cols['_rlnOriginXAngst'],cols['_rlnOriginYAngst']
 
 def process(fifa_glob, subset):
-    Rwin=[];csang=[];copies=[];meta=[]
+    Rwin=[];csang=[];copies=[];meta=[];cssh=[]
     for fn in glob.glob(fifa_glob):
         for ln in open(fn):
             t=ln.split()
@@ -66,31 +61,34 @@ def process(fifa_glob, subset):
             if row is None: continue
             Rwin.append(R.from_euler('zyz',[rot,tilt,psi],degrees=True).as_matrix())
             csang.append([float(row[CR]),float(row[CT]),float(row[CP])]); copies.append(cpy)
-            # meta: name, dfu,dfv,dfang,volt,cs,ampc, ox,oy, apix
+            cssh.append([float(row[OX]),float(row[OY])])
             meta.append((t[0],float(t[4]),float(t[5]),float(t[6]),float(t[7]),float(t[8]),float(t[9]),float(t[10]),float(t[11]),float(t[12])))
-    Rwin=np.array(Rwin); csang=np.array(csang); copies=np.array(copies)
+    Rwin=np.array(Rwin); csang=np.array(csang); copies=np.array(copies); cssh=np.array(cssh)
+    cfsh=np.array([[m[7],m[8]] for m in meta])                # cryoFIFA winning shift (px)
     csR=R.from_euler('ZYZ',csang,degrees=True).as_matrix()
     sel0=copies==0; Rg=kab(Rwin[sel0],csR[sel0])
     Uc={c:nearest(np.einsum('nij,jk,nkl->nil',np.transpose(Rwin[copies==c],(0,2,1)),Rg,csR[copies==c]).mean(0)) for c in range(8) if (copies==c).any()}
     Rcf=np.einsum('nij,njk->nik',Rwin,np.array([Uc[c] for c in copies]))
-    Rcfcs=np.einsum('ij,njk->nik',Rg.T,Rcf)                # cryoFIFA pose in cryoSPARC frame
-    res=geo(Rcfcs,csR); print(f"  subset {subset}: n={len(Rcf)} median vs cryoSPARC={np.median(res):.2f}deg")
-    ang=R.from_matrix(Rcfcs).as_euler('ZYZ',degrees=True)  # rot,tilt,psi
-    out=[]
-    for i,(nm,dfu,dfv,dfa,volt,cs,ampc,ox,oy,apix) in enumerate(meta):
-        # cryoFIFA's shift predictions do NOT correlate with cryoSPARC's (r~0 even for copy-0) -> they are
-        # unreliable, so we DON'T use them: OriginAngst=0 (reconstruct at the extraction centers, cleaner
-        # than injecting random shifts). Let cryoSPARC re-estimate shifts in a local refinement.
-        oxa,oya=0.0,0.0
-        out.append((nm,ang[i,0],ang[i,1],ang[i,2],oxa,oya,dfu,dfv,dfa,subset))
+    Rcfcs=np.einsum('ij,njk->nik',Rg.T,Rcf)
+    print(f"  subset {subset}: n={len(Rcf)} rot median vs cryoSPARC={np.median(geo(Rcfcs,csR)):.2f}deg")
+    ang=R.from_matrix(Rcfcs).as_euler('ZYZ',degrees=True)
+    # shift: per-copy least-squares fit cs_Angst ~ [cf_px,1] @ W   (best-possible conversion incl undo)
+    sh=np.zeros((len(meta),2))
+    if shift_mode=='fit':
+        for c in range(8):
+            m=copies==c
+            if m.sum()<10: continue
+            X=np.hstack([cfsh[m],np.ones((m.sum(),1))]); W,_,_,_=np.linalg.lstsq(X,cssh[m],rcond=None)
+            sh[m]=X@W
+        cc=np.corrcoef(sh[:,0],cssh[:,0])[0,1]
+        print(f"    shift fit corr (pred vs cryoSPARC): {cc:.3f}  (raw cryoFIFA shift head is weak)")
+    out=[(meta[i][0],ang[i,0],ang[i,1],ang[i,2],sh[i,0],sh[i,1],meta[i][1],meta[i][2],meta[i][3],subset) for i in range(len(meta))]
     return out, meta[0]
 
-allrows=[]; optics=None
-optics=process.__doc__  # placeholder
-rows_all=[]
-for gi,glb in enumerate(sys.argv[3:]):
+rows_all=[]; opt=None
+for gi,glb in enumerate(sys.argv[4:]):
     r,m0=process(glb, gi+1); rows_all+=r
-    if optics is None or gi==0: opt=m0
+    if opt is None: opt=m0
 volt,cs,ampc,apix=opt[4],opt[5],opt[6],opt[9]
 with open(out_path,'w') as f:
     f.write("\ndata_optics\n\nloop_\n_rlnOpticsGroup #1\n_rlnOpticsGroupName #2\n_rlnVoltage #3\n_rlnSphericalAberration #4\n_rlnAmplitudeContrast #5\n_rlnImagePixelSize #6\n_rlnImageSize #7\n_rlnImageDimensionality #8\n")
@@ -98,4 +96,4 @@ with open(out_path,'w') as f:
     f.write("\ndata_particles\n\nloop_\n_rlnImageName #1\n_rlnAngleRot #2\n_rlnAngleTilt #3\n_rlnAnglePsi #4\n_rlnOriginXAngst #5\n_rlnOriginYAngst #6\n_rlnDefocusU #7\n_rlnDefocusV #8\n_rlnDefocusAngle #9\n_rlnRandomSubset #10\n_rlnOpticsGroup #11\n")
     for nm,rot,tilt,psi,oxa,oya,dfu,dfv,dfa,sub in rows_all:
         f.write(f"{nm} {rot:.4f} {tilt:.4f} {psi:.4f} {oxa:.3f} {oya:.3f} {dfu:.1f} {dfv:.1f} {dfa:.3f} {sub} 1\n")
-print(f"wrote {out_path}: {len(rows_all)} particles")
+print(f"wrote {out_path}: {len(rows_all)} particles (shift_mode={shift_mode})")

@@ -417,10 +417,101 @@ def main():
 
   rescale_step=(end_radius-start_radius) /(args.mask_steps)
   current_free_mem = get_global_min_free_mem_gb(device)
+
+  # ---- encoder feature-map capture (interpretability, opt-in --dump_featmaps) ----
+  # Runs the encoder on a FIXED set of particles under eval/no_grad on a detached clone and saves the
+  # resnet conv-stage activations. Since the encoder input is deterministic (fixed lowpass preprocessing
+  # + fixed input_mask; no --lowpass_input here), the input is identical across epochs -> the evolution
+  # across snapshots isolates what the ENCODER WEIGHTS learn. Zero effect on the training graph.
+  _fixed_raw_y = None
+  def _capture_featmaps(epoch, raw_y):
+    import copy as _copy
+    _src = Encoder_Feature_Extractor.module if hasattr(Encoder_Feature_Extractor,'module') else Encoder_Feature_Extractor
+    core = _copy.deepcopy(_src).eval()    # isolated weight snapshot -> never perturb the training model/DDP/grad-checkpoint graph
+    res = core.feature_extractor.layers   # torchvision resnet18 (conv1 replaced, fc=Identity)
+    x = raw_y.to(device).view(-1,1,imgsize,imgsize).float()
+    if args.lowpass_input:
+      x = ift2(torch.mul(ft2(x), current_mask))
+    if args.gaussian or args.grad:
+      x = pre_module(x)
+    elif args.preprocess:
+      x = torch_apply_lowpass(x, args.preprocessing_output_channels, pre_module)
+    x = torch.mul(x, input_mask)
+    acts = {}; hooks = []
+    stages = {'stem':res.relu,'layer1':res.layer1,'layer2':res.layer2,'layer3':res.layer3,'layer4':res.layer4}
+    for nm,mod in stages.items():
+      hooks.append(mod.register_forward_hook(lambda m,i,o,nm=nm: acts.__setitem__(nm, o.detach().float().cpu())))
+    with torch.no_grad():
+      _x = x.contiguous(memory_format=torch.channels_last) if args.channels_last else x
+      core(_x)
+    for h in hooks: h.remove()
+    out = {'epoch':epoch, 'input':x.detach().float().cpu().half()}
+    for nm,a in acts.items(): out[nm]=a.half()
+    del core
+    _d = os.path.join(args.render_path,'featmaps'); os.makedirs(_d, exist_ok=True)
+    torch.save(out, os.path.join(_d, f'ep{epoch:03d}.pt'))
+    print(f'# [featmaps] epoch {epoch}: saved {x.size(0)} particles x {len(acts)} stages -> {_d}/ep{epoch:03d}.pt', flush=True)
+
+  # ---- shift-convention diagnostic (--shift_test): render synthetic no-CTF particles with the model's
+  # OWN decoder at KNOWN poses + KNOWN in-plane shifts, encode back, read copy-0 predicted shift vs known.
+  if args.shift_test and local_rank==0:
+    import numpy as _np
+    from scipy.spatial.transform import Rotation as _Rot
+    torch.set_grad_enabled(False)
+    dec=Decoder_3D.module if hasattr(Decoder_3D,'module') else Decoder_3D
+    efe=Encoder_Feature_Extractor.module if hasattr(Encoder_Feature_Extractor,'module') else Encoder_Feature_Extractor
+    e3d=Encoder_3D_Predictor.module if hasattr(Encoder_3D_Predictor,'module') else Encoder_3D_Predictor
+    dec.eval(); efe.eval(); e3d.eval()
+    cur_mask=fourier_masks[args.mask_steps-1]
+    B=64; NB=16; known=[]; pred=[]; rerr=[]; ccp=[]
+    cpg0=x_coord_plane.to(device)
+    for bi in range(NB):
+      Rk=torch.tensor(_Rot.random(B,random_state=1000+bi).as_matrix(),dtype=torch.float32,device=device)
+      tk=(torch.rand(B,2,device=device)-0.5)*10.0
+      cpg=cpg0.unsqueeze(0).expand(B,cpg0.size(0),cpg0.size(1))
+      rpg=torch.bmm(cpg,Rk.transpose(1,2)).reshape(B*imgsize*imgsize,3)
+      dout=dec(rpg).float().view(B,imgsize,imgsize,2)
+      Rref=torch.view_as_complex(dout.contiguous())*cur_mask     # unshifted render (Fourier)
+      predF=phase_shift_ft(Rref,tk,helper_x,helper_y)
+      ysyn=ift2(predF).real
+      # cross-correlation shift (standard torch.fft, DC-centered): argmax(fftshift(CC)) - center = shift
+      rr=ift2(Rref).real
+      Fa=torch.fft.fft2(rr); Fb=torch.fft.fft2(ysyn)
+      cc=torch.fft.fftshift(torch.fft.ifft2(Fb*torch.conj(Fa)).real,dim=(-2,-1))
+      _idx=cc.view(B,-1).argmax(1)
+      _r=(_idx//imgsize).float()-imgsize//2; _c=(_idx%imgsize).float()-imgsize//2
+      ccp.append(torch.stack([_r,_c],-1).cpu().numpy())
+      y=ysyn-ysyn.mean(dim=(1,2),keepdim=True)
+      ty=torch_apply_lowpass(y.view(B,1,imgsize,imgsize),args.preprocessing_output_channels,pre_module)
+      ty=image_duplicator(ty,args.sym_factor,args.rot_manner,[])
+      ty=torch.mul(ty,input_mask)
+      if args.channels_last: ty=ty.contiguous(memory_format=torch.channels_last)
+      z=e3d(efe(ty))
+      tr=(z[:,-2:]*args.dx_scale*imgsize)[:B]
+      Rm=transforms.rotation_6d_to_matrix(sixd_to_two_orthonormal(z[:,:6]))[:B]
+      fro=torch.einsum('nij,nij->n',Rm,Rk).cpu().numpy()
+      rerr.append(_np.degrees(_np.arccos(_np.clip((fro-1)/2,-1,1))))
+      known.append(tk.cpu().numpy()); pred.append(tr.cpu().numpy())
+    known=_np.concatenate(known); pred=_np.concatenate(pred); rerr=_np.concatenate(rerr)
+    print(f"# [shift_test] {len(known)} synthetic particles; copy-0 rotation median err={_np.median(rerr):.2f}deg (low => encoder poses clean synthetic well)",flush=True)
+    for j in range(2):
+      print(f"#   comp{j}: corr(pred,known)={_np.corrcoef(pred[:,j],known[:,j])[0,1]:.3f}  pred_rms={_np.sqrt((pred[:,j]**2).mean()):.2f}px known_rms={_np.sqrt((known[:,j]**2).mean()):.2f}px",flush=True)
+    A=_np.hstack([known,_np.ones((len(known),1))]); W,_,_,_=_np.linalg.lstsq(A,pred,rcond=None)
+    print("#   linear map known->pred  W (rows k0,k1,bias; cols pred0,pred1):\n"+_np.array2string(W,precision=3),flush=True)
+    ccp=_np.concatenate(ccp)
+    print("#   --- CROSS-CORRELATION shift refinement (proposed fix) ---",flush=True)
+    for j in range(2):
+      print(f"#   CC comp{j}: corr(cc,known)={_np.corrcoef(ccp[:,j],known[:,j])[0,1]:.3f}  cc_rms={_np.sqrt((ccp[:,j]**2).mean()):.2f}px",flush=True)
+    Wc,_,_,_=_np.linalg.lstsq(A,ccp,rcond=None)
+    print("#   linear map known->CC  Wc:\n"+_np.array2string(Wc,precision=3),flush=True)
+    _np.savez('/tmp/shift_test.npz',known=known,pred=pred,rerr=rerr,ccp=ccp)
+    print("# [shift_test] saved /tmp/shift_test.npz",flush=True); sys.exit(0)
+
   #==================================#
   for epoch in range(start_epoch, args.num_epochs):
     current_trunk=1
     sampler.set_epoch(epoch)
+    _cap_done = False
 
     # ---- per-epoch LR schedule ---- (cur_lr is shown in the progress line below)
     # Determine the marching frontier + whether the box-228 local-refine stage has engaged, so the
@@ -429,7 +520,7 @@ def main():
     # then was further scaled by local_refine_scale (0.3) -> effective ~6e-6 on a freshly-initialised
     # encoder -> inert refine -> resolution capped at the coarse (~4A) level.
     current_reconstruct_radius=min(imgsize//2,min(args.mask_steps,(int(epoch/args.mask_epoch))*rescale_step+start_radius)*imgsize)
-    if args.downsample_train and current_reconstruct_radius>args.downsample_radius and fade_in_start_epoch==0:
+    if args.downsample_train and current_reconstruct_radius>args.downsample_radius and not args.coarse_only and fade_in_start_epoch==0:
       fade_in_start_epoch=epoch
     cur_lr = lr; local_lr = lr
     if args.lr_schedule != 'none':
@@ -476,12 +567,12 @@ def main():
     mask_index=min(int(epoch/args.mask_epoch),args.mask_steps-1)
     # this mask is applied on reconstructed images\input_coord grid. (also input ft image)
 
-    if args.downsample_train and current_reconstruct_radius>args.downsample_radius:
+    if args.downsample_train and current_reconstruct_radius>args.downsample_radius and not args.coarse_only:
       if fade_in_start_epoch==0 :
         fade_in_start_epoch=epoch
 
-      Encoder_Feature_Extractor.eval()     
-      Encoder_3D_Predictor.eval()       
+      Encoder_Feature_Extractor.eval()
+      Encoder_3D_Predictor.eval()
       if epoch - fade_in_start_epoch < args.fade_in_epochs:
         Decoder_3D.eval()    
       else:
@@ -532,7 +623,13 @@ def main():
         #print(y.size())
         y=y-y.mean(dim=(1, 2), keepdim=True)
 
-        ctf=ctf.to(device)       
+        if args.dump_featmaps and local_rank==0:
+          if _fixed_raw_y is None:
+            _fixed_raw_y = y[:min(args.featmap_n, y.size(0))].detach().clone()   # fix the particles once
+          if (epoch % args.featmap_interval == 0) and not _cap_done:
+            _capture_featmaps(epoch, _fixed_raw_y); _cap_done = True
+
+        ctf=ctf.to(device)
         ctf_max=ctf.max()
         ctf_min=ctf.mean()
         train_y=y
@@ -581,9 +678,9 @@ def main():
           # New pre module should downsample particles together
           train_y=torch.mul(train_y,input_mask)
           if args.downsample_train:
-            if current_reconstruct_radius>args.downsample_radius  :
+            if current_reconstruct_radius>args.downsample_radius and not args.coarse_only :
               Encoder_Feature_Extractor.eval()
-              Encoder_3D_Predictor.eval()       
+              Encoder_3D_Predictor.eval()
               features_local=enc_fwd(Encoder_Feature_Extractor_Local, train_y, args)
               features=enc_fwd(Encoder_Feature_Extractor, downsampled_train_y, args)
             else:
@@ -598,9 +695,22 @@ def main():
             else:
               features=enc_fwd(Encoder_Feature_Extractor, train_y, args)
 
-          z_3d=Encoder_3D_Predictor(features) 
-          if args.downsample_train and current_reconstruct_radius>args.downsample_radius :
+          z_3d=Encoder_3D_Predictor(features)
+          if args.downsample_train and current_reconstruct_radius>args.downsample_radius and not args.coarse_only :
             z_3d_local=Encoder_3D_Predictor_Local(features_local)
+            if getattr(args,'log_refine_delta',False) and local_rank==0:
+              # local refiner correction: geodesic angle (coarse pose -> refined pose) + shift, copy-0 subset
+              with torch.no_grad():
+                _n=data_block_size
+                _Rc=transforms.rotation_6d_to_matrix(z_3d[:_n,:6].detach().float())
+                _Rr=transforms.rotation_6d_to_matrix((z_3d[:_n,:6]+z_3d_local[:_n,:6]*args.local_refine_scale).detach().float())
+                _rel=torch.matmul(_Rc.transpose(-1,-2),_Rr)
+                _tr=_rel[:,0,0]+_rel[:,1,1]+_rel[:,2,2]
+                _dth=torch.acos(torch.clamp((_tr-1.0)/2.0,-1.0,1.0))*(180.0/np.pi)
+                _dsh=torch.norm(z_3d_local[:_n,-2:].detach().float()*args.local_refine_scale,dim=1)*args.dx_scale*imgsize
+                _k=max(1,int(round(0.9*_dth.numel())))
+                with open(os.path.join(args.render_path,'refine_delta.txt'),'a') as _f:
+                  _f.write("%d %.4f %.4f %.4f %.4f %.4f %d\n"%(epoch,float(_dth.median()),float(_dth.mean()),float(_dth.kthvalue(_k)[0]),float(_dth.max()),float(_dsh.median()),_dth.numel()))
             z_3d=z_3d+z_3d_local*args.local_refine_scale
 
           rotation_3d=z_3d[:,:6]
@@ -649,7 +759,18 @@ def main():
           #-----------apply translation and CTF on pred images
           pred_images_3d = torch.view_as_complex(pred_images_3d)
 
-          pred_images_3d=phase_shift_ft(pred_images_3d,translation_3d,helper_x,helper_y)
+          _unshift = pred_images_3d if (getattr(args,'cc_export',False) and args.pose_infer) else None
+          if args.cc_shift and (not args.pose_infer) and epoch >= args.cc_shift_start_epoch:
+            # cross-correlation shift: align the (unshifted) render to the particle -> accurate shift (px)
+            with torch.no_grad():
+              _rr=ift2(pred_images_3d).real
+              _cc=torch.fft.fftshift(torch.fft.ifft2(torch.fft.fft2(y.view(b,imgsize,imgsize))*torch.conj(torch.fft.fft2(_rr))).real,dim=(-2,-1))
+              _idx=_cc.view(b,-1).argmax(1)
+              cc_shift=torch.stack([(_idx//imgsize).float()-imgsize//2,(_idx%imgsize).float()-imgsize//2],-1).to(translation_3d.dtype)
+            pred_images_3d=phase_shift_ft(pred_images_3d,cc_shift,helper_x,helper_y)
+          else:
+            cc_shift=None
+            pred_images_3d=phase_shift_ft(pred_images_3d,translation_3d,helper_x,helper_y)
 
           # ---- Gaussian spectral (volume) prior (upgrade #3) ----
           # Penalize predicted Fourier amplitude, shell-weighted so high frequencies
@@ -769,6 +890,13 @@ def main():
             else:
               loss_3d,active_path= symmetric_complex_loss(pred_images_3d,y_ft,args.sym_factor)
 
+          # supervise the encoder shift head toward the CC shift of the WINNING copy (teaches an accurate
+          # amortized shift; fixes the ~2x under-scale automatically since translation_3d is in px).
+          if cc_shift is not None:
+            _no=loss_3d.size(0)
+            _flatc=(active_path.long()*_no + torch.arange(_no,device=loss_3d.device))
+            loss_3d=loss_3d + args.cc_shift_weight*((translation_3d[_flatc]-cc_shift[_flatc].detach())**2).mean(1)
+
           if args.pose_infer:
             # BEST-OF-8 export: active_path[p] in {0..sym-1} is the winning in-plane sym copy for
             # particle p (the pose the reconstruction actually used). Batch layout is [copy][particle]
@@ -778,7 +906,43 @@ def main():
             _flat=(active_path.long()*n_orig + torch.arange(n_orig,device=active_path.device))
             _eul=Rotation.from_matrix(transforms.rotation_6d_to_matrix(norm_rotation_3d[_flat].float()).cpu().detach().numpy()).as_euler('zyz', degrees=True)
             _cpy=active_path.long().cpu().detach().numpy()
-            _tr=translation_3d[_flat].cpu().detach().numpy()
+            if _unshift is not None:
+              # POST-HOC CC shift: cross-correlate the winning-copy render (unshifted) vs its particle ->
+              # accurate sub-pixel shift (px), decoupled from ab-initio. Same winning-copy frame as the
+              # head shift, so export_star_for_cryosparc.py 'ortho' per-copy transform applies unchanged.
+              _rrw=ift2(_unshift[_flat]).real
+              _yyw=y.view(b,imgsize,imgsize)[_flat]
+              _ccw=torch.fft.fftshift(torch.fft.ifft2(torch.fft.fft2(_yyw)*torch.conj(torch.fft.fft2(_rrw))).real,dim=(-2,-1))
+              _ciw=_ccw.view(n_orig,-1).argmax(1)
+              _tr=torch.stack([(_ciw//imgsize).float()-imgsize//2,(_ciw%imgsize).float()-imgsize//2],-1).cpu().detach().numpy()
+            else:
+              _tr=translation_3d[_flat].cpu().detach().numpy()
+            if getattr(args,'loss_export',False):
+              # per-particle best-of-8 reconstruction loss + name (for loss-vs-SNR / contribution tracking)
+              _lv=loss_3d.detach().float().cpu().numpy()
+              with open(os.path.join(args.render_path,'loss_infer_rank%d.txt'%rank),'a+') as _lf:
+                for _i in range(n_orig): _lf.write(particles_name[_i]+' '+str(float(_lv[_i]))+'\n')
+            if getattr(args,'conf_export',False):
+              # per-particle best-of-8 CONFIDENCE (GT-free particle filtering). Recompute the 8 in-plane
+              # hypothesis L2 distances [sym, n_orig] from the same pred/gt the loss saw (layout copy*n_orig+p).
+              # Absolute loss conflates SNR with pose-correctness; the WITHIN-particle spread of the 8
+              # hypotheses is self-normalized (all 8 share the particle's noise) -> a cleaner pose-confidence.
+              with torch.no_grad():
+                _dd=torch.mean((pred_images_3d.real-y_ft.real)**2+(pred_images_3d.imag-y_ft.imag)**2,dim=-1).reshape(args.sym_factor,n_orig)  # [sym,n_orig]
+                _sd,_=torch.sort(_dd,dim=0)                       # ascending: _sd[0]=winner, _sd[1]=runner-up
+                _d1=_sd[0]; _d2=_sd[1]; _dmean=_dd.mean(0); _dstd=_dd.std(0)
+                _w=torch.softmax(-_dd/(_dmean*0.1+1e-8),dim=0)    # per-particle softmin weights over the 8
+                _wmax=_w.max(0).values; _ent=-(_w*torch.log(_w+1e-9)).sum(0)
+                _c=[t.float().cpu().numpy() for t in (_d1,_d2,_dmean,_dstd,_wmax,_ent)]
+              with open(os.path.join(args.render_path,'conf_infer_rank%d.txt'%rank),'a+') as _cf:
+                for _i in range(n_orig):
+                  _cf.write("%s %.6g %.6g %.6g %.6g %.6g %.6g\n"%(particles_name[_i],_c[0][_i],_c[1][_i],_c[2][_i],_c[3][_i],_c[4][_i],_c[5][_i]))
+              # full 8 per-copy losses in COPY ORDER (0-3=rot 0/90/180/270, 4-7=their mirror-flips) ->
+              # symmetry/handedness structure not visible in the summary stats.
+              _ddc=_dd.float().cpu().numpy()   # [sym, n_orig]
+              with open(os.path.join(args.render_path,'full8_infer_rank%d.txt'%rank),'a+') as _ff:
+                for _i in range(n_orig):
+                  _ff.write(particles_name[_i]+' '+' '.join('%.6g'%_ddc[_j,_i] for _j in range(args.sym_factor))+'\n')
             _pf=os.path.join(args.render_path, args.output_pose_file+'_infer_rank%d.star'%rank)
             _new_pf=not os.path.exists(_pf)
             _fh=open(_pf,'a+')
@@ -908,11 +1072,11 @@ def main():
           if update_grad :
             if mode=='3d':
               if args.downsample_train:
-                if current_reconstruct_radius <  args.downsample_radius  : 
+                if current_reconstruct_radius <  args.downsample_radius or args.coarse_only :
 
-                  scaler.step(Encoder_Feature_Extractor_Optimer) 
+                  scaler.step(Encoder_Feature_Extractor_Optimer)
                   scaler.step(Encoder_3D_Predictor_Optimer)
-                  scaler.step(Decoder_3D_Optimer)   
+                  scaler.step(Decoder_3D_Optimer)
                 else:
                   scaler.step(Encoder_Feature_Extractor_Optimer_Local)
                   scaler.step(Encoder_3D_Predictor_Optimer_Local)
@@ -1101,6 +1265,9 @@ def main():
             if (epoch+1) % _ckpt_int == 0:
               save_checkpoint(os.path.join(args.render_path, 'checkpoint.pt'), epoch,
                               checkpoint_models, checkpoint_optimizers, scaler, args)
+              if getattr(args,'checkpoint_keep_all',False):
+                save_checkpoint(os.path.join(args.render_path, 'checkpoint_ep%d.pt'%(epoch+1)), epoch,
+                                checkpoint_models, checkpoint_optimizers, scaler, args)
               print('# saved checkpoint at epoch %d' % (epoch+1), file=sys.stderr)
 
 

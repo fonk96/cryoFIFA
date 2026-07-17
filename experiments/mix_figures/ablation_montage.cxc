@@ -1,0 +1,50 @@
+# cryoFIFA marching x loss-rank ablation -- 12 final reconstructions, PRE-ALIGNED, tiled 3 rows x 4 columns.
+# Maps were rigid-body aligned offline (align_maps.py) to curric_marchonly_03, so this just opens + tiles
+# (instant; no fitmap in ChimeraX). Open in ChimeraX:  chimerax ablation_montage.cxc   (or File > Open)
+#
+# GRID (row-major, `tile` fills left->right, top->bottom):
+#            col1: neither     col2: loss-rank only   col3: march only   col4: both
+#   row1  SNR 0.1  (floor)        #1  #2  #3  #4        (grey)
+#   row2  SNR 0.3  (clean)        #5  #6  #7  #8        (tan)
+#   row3  SNR 0.1+0.3 mix         #9  #10 #11 #12       (cornflower blue)
+#
+# Uniform isosurface level 1.3 (adjust with:  volume all level <X> ).
+set bgColor white
+
+# ---- row 1 : SNR 0.1 ----
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr01_neither.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr01_lossrankonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr01_marchonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr01_both.mrc
+# ---- row 2 : SNR 0.3 ----
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr03_neither.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr03_lossrankonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr03_marchonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/snr03_both.mrc
+# ---- row 3 : mix 0.1+0.3 ----
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/mix_neither.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/mix_lossrankonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/mix_marchonly.mrc
+open /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/results/2026_Jul_06/aligned_maps/mix_both.mrc
+
+volume #1-4   level 1.2 color gray             style surface step 1
+volume #5-8   level 1.2 color tan              style surface step 1
+volume #9-12  level 1.2 color cornflower blue  style surface step 1
+
+lighting soft
+graphics silhouettes true width 1.2
+camera ortho
+tile columns 4
+view
+
+# labels (screen coords 0-1; nudge for your window aspect)
+2dlabels create c1 text "neither"        xpos 0.09 ypos 0.96 size 15 color black
+2dlabels create c2 text "loss-rank only" xpos 0.31 ypos 0.96 size 15 color black
+2dlabels create c3 text "march only"     xpos 0.57 ypos 0.96 size 15 color black
+2dlabels create c4 text "both"           xpos 0.85 ypos 0.96 size 15 color black
+2dlabels create r1 text "SNR 0.1"     xpos 0.005 ypos 0.80 size 14 color dim gray
+2dlabels create r2 text "SNR 0.3"     xpos 0.005 ypos 0.50 size 14 color dark goldenrod
+2dlabels create r3 text "0.1+0.3 mix" xpos 0.005 ypos 0.19 size 14 color cornflower blue
+
+# to render a high-res PNG:
+#   save /sddn/kongfang_work/cryoFIFA/V260706/cryoFIFA/experiments/mix_figures/ablation_montage.png width 3600 supersample 3

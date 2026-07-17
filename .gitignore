@@ -20,3 +20,12 @@ __pycache__/
 # lmdb / data blobs
 *.lmdb
 *.mdb
+
+# backups + oversized montage figures
+*.bak
+experiments/snr_figures/*montage*.pdf
+experiments/**/*montage*.pdf
+
+# data artifacts (regenerable)
+*.npz
+experiments/**/refine_delta.txt

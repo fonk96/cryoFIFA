@@ -198,6 +198,32 @@ def get_parser():
     parser.add_argument('--optimizer',type=str,default='adam')
     parser.add_argument('--encoder_backbone',type=str,default='resnet')
     parser.add_argument('--encoder_basename',type=str,default='resnet18')
+    # encoder feature-map capture (interpretability): every --featmap_interval epochs, dump the resnet
+    # conv-stage activations for --featmap_n FIXED particles. rank0-only, eval/no_grad on a detached
+    # clone -> zero effect on training math. Off by default.
+    parser.add_argument('--dump_featmaps',action='store_true',default=False)
+    parser.add_argument('--featmap_interval',type=int,default=10)
+    parser.add_argument('--featmap_n',type=int,default=10)
+    # shift-convention diagnostic: render synthetic no-CTF particles with the model's OWN decoder at
+    # KNOWN poses + KNOWN in-plane shifts, encode them back, and log predicted vs known shift (copy 0).
+    parser.add_argument('--shift_test',action='store_true',default=False)
+    # cross-correlation shift refinement in training: once structure exists (epoch>=cc_shift_start_epoch),
+    # use the CC-aligned shift for the reconstruction loss AND supervise the encoder shift head toward it
+    # (so the head learns an accurate, amortized shift instead of the weak/2x-underscaled prediction).
+    parser.add_argument('--cc_shift',action='store_true',default=False)
+    parser.add_argument('--cc_shift_start_epoch',type=int,default=40)
+    parser.add_argument('--cc_shift_weight',type=float,default=0.1)
+    # post-hoc CC shift at INFERENCE (--pose_infer): export the cross-correlation shift of the winning
+    # copy (accurate, decoupled from ab-initio) instead of the weak head shift. Safe -- no training change.
+    parser.add_argument('--cc_export',action='store_true',default=False)
+    # per-particle loss export (with --pose_infer): write <name loss> per particle (for loss-vs-SNR /
+    # contribution-tracking diagnostics on mixed-SNR data). And keep per-epoch checkpoints for that tracking.
+    parser.add_argument('--loss_export',action='store_true',default=False)
+    # per-particle best-of-8 CONFIDENCE export (with --pose_infer): from the 8 in-plane hypothesis
+    # distances -> conf_infer_rank*.txt (name d1 d2 dmean dstd wmax entropy). Self-normalized within a
+    # particle (SNR-independent) -> a GT-free filter that should beat raw loss for picking well-posed particles.
+    parser.add_argument('--conf_export',action='store_true',default=False)
+    parser.add_argument('--checkpoint_keep_all',action='store_true',default=False)
     parser.add_argument('--mask_steps',type=int,default=3)
     parser.add_argument('--mask_epoch',type=int,default=10)
     parser.add_argument('--port',type=str,default='12306')
@@ -287,7 +313,8 @@ def get_parser():
     parser.add_argument('--downsample_radius',type=int,default=32)
     parser.add_argument('--downsample_soft_crop',type=float,default=0.0,help='Apodize the downsample_input Fourier crop with a raised-cosine window tapering over this outer fraction of the crop (e.g. 0.15). 0 = original hard box crop (sinc ringing). Removes the ringing the double-encoder global branch was fed.')
     parser.add_argument('--downsample_train_epoch',type=int,default=0)
-    parser.add_argument('--translation_restrain',action='store_true',default=False) 
+    parser.add_argument('--coarse_only',action='store_true',default=False,help='downsample_train but NEVER engage the local full-res encoder: pose is predicted only from the low-res coarse input for ALL epochs (frequency marching still drives the decoder/loss). Skips the local encoder forward entirely -> cheaper. Result-preserving when off.')
+    parser.add_argument('--translation_restrain',action='store_true',default=False)
 
     parser.add_argument('--translation_restrain_epoch',type=int,default=0)  
         
@@ -323,8 +350,9 @@ def get_parser():
     parser.add_argument('--write_device',type=int,default=1) 
     #--------------------------------------#
 
-    parser.add_argument('--local_refine_scale',type=float,default=0.1)  
-    parser.add_argument('--global_bins',type=float,default=18)  
+    parser.add_argument('--local_refine_scale',type=float,default=0.1)
+    parser.add_argument('--log_refine_delta',action='store_true',default=False,help='Log the local refiner angular/shift correction (coarse pose -> refined pose) per minibatch to refine_delta.txt. Opt-in, result-preserving.')
+    parser.add_argument('--global_bins',type=float,default=18)
     parser.add_argument('--use_KAN',action='store_true',default=False)  
 
     parser.add_argument('--global_smooth',action='store_true',default=False)

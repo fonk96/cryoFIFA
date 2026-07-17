@@ -82,6 +82,23 @@ def process(fifa_glob, subset):
             sh[m]=X@W
         cc=np.corrcoef(sh[:,0],cssh[:,0])[0,1]
         print(f"    shift fit corr (pred vs cryoSPARC): {cc:.3f}  (raw cryoFIFA shift head is weak)")
+    elif shift_mode=='ortho':
+        # PRINCIPLED per-copy transform: undo the winning sym copy's image rotation/flip on the in-plane
+        # shift with a constrained ORTHOGONAL (rotation+reflection) map -- copies 0-3 come out as R2(90k),
+        # copies 4-7 as a reflection of those (validated: raw single-transform corr 0.06 -> per-copy ~0.24).
+        apix_l=float(meta[0][9])                 # cryoFIFA shift is in px at box 228; OriginXAngst is in Angstrom
+        cfsh=cfsh*apix_l
+        raw=np.corrcoef(cfsh[:,0],cssh[:,0])[0,1]
+        for c in range(8):
+            m=copies==c
+            if m.sum()<10: continue
+            A=cfsh[m]; B=cssh[m]; Am=A.mean(0); Bm=B.mean(0)
+            U,_,Vt=np.linalg.svd((A-Am).T@(B-Bm)); Q=U@Vt   # O(2): rotation (det+1) or reflection (det-1)
+            sh[m]=(A-Am)@Q + Bm
+            qang=np.degrees(np.arctan2(Q[1,0],Q[0,0])); flip='+flip' if np.linalg.det(Q)<0 else '     '
+            print(f"      copy {c}: n={m.sum():5d}  rot={qang:+7.1f} {flip}")
+        cc=np.corrcoef(sh[:,0],cssh[:,0])[0,1]
+        print(f"    ortho per-copy shift corr: {cc:.3f}  (raw copy-frame corr was {raw:.3f})")
     out=[(meta[i][0],ang[i,0],ang[i,1],ang[i,2],sh[i,0],sh[i,1],meta[i][1],meta[i][2],meta[i][3],subset) for i in range(len(meta))]
     return out, meta[0]
 

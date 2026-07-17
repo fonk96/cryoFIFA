@@ -17,12 +17,10 @@ were separated out. All 20 `src/` files pass a syntax check, confirming the copy
 ├── ASSESSMENT.md        ← scientific judgment: what's genius, why it plateaus, where to push
 ├── STRUCTURE.md         ← this file
 │
-├── src/                 ← the active import web (run trainers from here, or PYTHONPATH=src)
-│   ├── cryofifa.py            (current production trainer — the one in run_2026_0706.sh)
-│   ├── kryoAE_trunk.py        (near‑identical sibling trainer)
-│   ├── cryofifa_2026.py       (variant snapshot)
-│   ├── cryofifa_back.py       (variant snapshot)
-│   ├── cryoFIFA_Multiclass.py (discrete‑heterogeneity variant)
+├── src/                 ← the active import web (the entry point + modules it imports)
+│   ├── cryofifa_ddpfix.py     ← ★ THE current, usable entry point (DDP‑fixed trainer; all
+│   │                            experiments/ run scripts call ../src/cryofifa_ddpfix.py). Old
+│   │                            trainer versions were moved to archive/ (see below).
 │   ├── merged_models.py       (model library: SirenNet, Fullnet, Feature_Extractor, …)
 │   ├── PDO_models.py          (p8 steerable group‑CNN backbone)
 │   ├── cam_module.py          (Grad‑CAM; imported by the trainers)
@@ -50,10 +48,18 @@ were separated out. All 20 `src/` files pass a syntax check, confirming the copy
 │   ├── environment.yaml  (conda env spec — was cryofifa.yaml; py3.8, torch2.0.1/cu118, pytorch3d)
 │   └── paths             (dataset‑name → .star path map, source'd by run scripts)
 │
-├── experiments/
-│   └── run_2026_0706.sh  (current launch script)
+├── experiments/         ← launch + ablation + analysis scripts (all call ../src/cryofifa_ddpfix.py)
+│   ├── run_ablation_{train,poseinfer}.sh, driver_*.sh, chain_*.sh  (ablation / mixed‑SNR / GT‑free‑filter runs)
+│   ├── analyze_*.py, plot_*.py, export_*.py, pose_bestof8.py       (scoring, figures, star export)
+│   └── run_2026_0706.sh                                            (dated launch script)
 │
-└── archive/             ← dead / broken / legacy (nothing in src imports these)
+└── archive/             ← superseded / dead / legacy (nothing in src imports these)
+    ├── cryofifa.py              ← previous production trainer, SUPERSEDED by src/cryofifa_ddpfix.py
+    ├── kryoAE_trunk.py          (near‑identical sibling trainer)
+    ├── cryofifa_2026.py         (variant snapshot)
+    ├── cryofifa_back.py         (variant snapshot)
+    ├── cryoFIFA_Multiclass.py   (discrete‑heterogeneity variant)
+    ├── patch_cryofifa_ddpfix{,_v2,_v3}.py  (one‑off patch scripts)
     ├── half3d_new.py            (legacy trainer; imports a missing `new_model_utils` → won't run)
     ├── backup_build_encoder.py  (empty class + commented body)
     ├── parnet.py                (unused ParNet; has a full‑tensor randperm bug)
@@ -66,14 +72,14 @@ were separated out. All 20 `src/` files pass a syntax check, confirming the copy
 ### How to run from this copy
 
 ```bash
-cd /home/user/cryoFIFA/src
-source ../configs/paths                 # defines $Beta2_128 etc. (edit data_path first)
-torchrun --nproc_per_node 8 cryofifa.py --particles_meta $Beta2_128 --lmdb_path ... [flags]
+cd cryoFIFA/experiments
+source ../configs/paths                 # defines $B2_act_half1 etc. (edit data_path first)
+torchrun --nproc_per_node 8 ../src/cryofifa_ddpfix.py --particles_meta $B2_act_half1 --lmdb_path ... [flags]
 ```
 
-The trainers must be launched **from `src/`** (or with `PYTHONPATH=/home/user/cryoFIFA/src`) because
-the modules import each other flat. Tools in `tools/` that import project modules (e.g. `compare_ft`)
-likewise need `src/` on the path.
+`torchrun ../src/cryofifa_ddpfix.py` works from anywhere (Python puts the script's dir, `src/`, on
+`sys.path[0]`, so the flat `from X import *` web resolves); the `experiments/` run scripts do exactly
+this. If you import project modules from elsewhere, add `PYTHONPATH=<repo>/src`.
 
 ### What was intentionally left out
 

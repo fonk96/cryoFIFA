@@ -2,8 +2,9 @@
 
 > Fourier‑domain **I**mplicit‑**F**unction **A**uto‑encoder for ab‑initio / heterogeneous
 > single‑particle **cryo**‑EM 3D reconstruction.
-> (The `AE` in the current trainer name `kryoAE_trunk.py` confirms the autoencoder framing;
-> "FIFA" is the author's project codename — treat the exact expansion as informal.)
+> (The `AE` in the legacy trainer name `kryoAE_trunk.py` confirms the autoencoder framing;
+> "FIFA" is the author's project codename — treat the exact expansion as informal.
+> The current entry point is `src/cryofifa_ddpfix.py`; older trainers live in `archive/`.)
 
 Source analysed: `/sddn/kongfang_work/cryoFIFA/scripts/` (~11 k lines of Python, ~40 files),
 plus dated full‑directory snapshots `V2402/ V2503/ V2509/ V2512/ Pure/` (the project's
@@ -135,19 +136,19 @@ Key mechanisms that make ab‑initio training converge:
 | **FFT / CTF** | `fourier_utils.py` (`ft2/ift2/ft3/ift3`, `create_ctf`, `phase_shift_ft`) | Centered convention `fftshift∘fftn∘ifftshift`; relativistic CTF in cycles/Å. |
 | **Data** | `new_dataloader.py` (`LmdbDataSet`, `StarDataSet`), `untiled.py` (`Dataloader`, star/MRC IO + LMDB baking) | Hand‑rolled star parser; LMDB is the production path. |
 | **Training toolbox** | `utils.py` (1559 lines), `new_utils.py` | ~250 argparse flags, masks, losses, coordinate grids, frequency schedule, pose‑uniformity loss, CTF. |
-| **Trainers** | `cryofifa.py` / `kryoAE_trunk.py` (current), `cryofifa_2026.py`, `cryofifa_back.py`, `half3d_new.py` (legacy), `cryoFIFA_Multiclass.py` (discrete het.) | torchrun + NCCL DDP, AMP `float16`, per‑model Adam, gradient accumulation, dynamic minibatch sizing. |
+| **Trainer (entry point)** | **`cryofifa_ddpfix.py`** — the single current, usable entry point | torchrun + NCCL DDP, AMP `float16`, per‑model Adam, gradient accumulation, dynamic minibatch sizing, `--fast_ddp`/`--channels_last`/`--grad_checkpoint`, `--coarse_only`, per‑particle `--loss_export`/`--conf_export`. Old trainers (`cryofifa.py`, `kryoAE_trunk.py`, `cryofifa_2026.py`, `cryofifa_back.py`, `cryoFIFA_Multiclass.py`) are archived under `archive/`. |
 | **Reporting / conversion / interpretability** | `experiment_report_generator.py` (PDF of tri‑view slices), `kcs2star.py` (cryoSPARC→star), `cam_module.py` (Grad‑CAM), `dataio.py`/`cryosparc_simulator.py` (synthetic projections), `swd.py` (sliced‑Wasserstein metric). | Mostly peripheral / diagnostic. |
 
 ---
 
 ## 4. How a training run works
 
-Runs are launched from a dated shell script (`run_2026_0706.sh`) that `source`s `paths`
-(dataset name → `.star` path map) and calls `torchrun --nproc_per_node 8 cryofifa.py …`
+Runs are launched from a shell script under `experiments/` that `source`s `paths`
+(dataset name → `.star` path map) and calls `torchrun --nproc_per_node 8 ../src/cryofifa_ddpfix.py …`
 with a long flag string. A representative invocation (β2‑adrenergic, bin1, half‑map):
 
 ```bash
-torchrun --nproc_per_node 8 cryofifa.py \
+torchrun --nproc_per_node 8 ../src/cryofifa_ddpfix.py \
   --particles_meta ${B2_act_half2} --lmdb_path /data/lmdb/B2_act_half2 \
   --imgsize 228 --data_path /data/cryoFIFA_data/ \
   --encoder_backbone resnet --encoder_basename resnet18 \
@@ -159,7 +160,7 @@ torchrun --nproc_per_node 8 cryofifa.py \
   --world_size 8 --free_gpu_memory 8 --render_path results/<date>/<run>/
 ```
 
-The loop (see `cryofifa.py`): for each epoch it selects the current resolution shell,
+The loop (see `cryofifa_ddpfix.py`): for each epoch it selects the current resolution shell,
 optionally shrinks the minibatch if free GPU memory drops below `--free_gpu_memory`,
 runs the encoder→decoder→Fourier forward model under AMP, accumulates gradients up to
 `--batch_size`, steps the (separate) Adam optimizers, and every `--save-interval` epochs

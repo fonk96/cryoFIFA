@@ -26,8 +26,9 @@ It is a research reimplementation/extension in the same family as **cryoDRGN**,
 ### BEFORE TRAINING:
 We strongly recommond you to cache particles to LMDB database first.
 usage:
-` python  src/lmdbwriter.py --particles_meta ${your_particles.star}  --data_path ${data_path} --db_path ${lmdb_path}${datasetname}
-
+```
+python  src/lmdbwriter.py --particles_meta ${your_particles.star}  --data_path ${data_path} --db_path ${lmdb_path}${datasetname}
+```
 ## 2. How a training run works
 
 Runs are launched from a shell script under `experiments/` that `source`s `paths`
@@ -44,6 +45,6 @@ torchrun --nproc_per_node 8 ../src/cryofifa.py \
   --start_resolution 40 --end_resolution 4 --mask_steps 64 --mask_epoch 3 \
   --num-epochs 50 --minibatch-size 32 --batch_size 32 --float16 --preprocess \
   --add_distrubance --distrubance_ratio 0.5 --distrubance_epoch 70 --uniform \
-  --world_size 8 --free_gpu_memory 8 --render_path results/<date>/<run>/
+  --world_size 8 --free_gpu_memory 8 --render_path results/<run>/
 ```
 

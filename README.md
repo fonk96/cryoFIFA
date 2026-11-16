@@ -23,10 +23,10 @@ It is a research reimplementation/extension in the same family as **cryoDRGN**,
 
 ---
 
-BEFORE TRAINING:
+### BEFORE TRAINING:
 We strongly recommond you to cache particles to LMDB database first.
 usage:
-python 
+` python  src/lmdbwriter.py --particles_meta ${your_particles.star}  --data_path ${data_path} --db_path ${lmdb_path}${datasetname}
 
 ## 2. How a training run works
 

@@ -55,9 +55,6 @@ def gencoords (N, d, radwn=None, device=None,exclude_dc=False, herm=False):
 
 
 def butterworth(N, d, cutoffwn, order=1,device=None):
-    """
-    巴特沃斯滤波器
-    """
     xy = gencoords(N, d,device)
     r2 = (xy**2).sum(axis=1).reshape((N,)*d)
     f = 1.0 / (1.0 + (r2 / cutoffwn ** 2)**order)
@@ -65,9 +62,6 @@ def butterworth(N, d, cutoffwn, order=1,device=None):
 
 
 def lowpass_mask(N, d, radwn=None, lowpasstype='butterworth', lowpassorder=1,device=None):
-    """
-    低通滤波的Mask
-    """
     if radwn is None:
         return 1.0
     if lowpasstype == 'butterworth':

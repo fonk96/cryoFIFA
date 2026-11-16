@@ -57,91 +57,10 @@ reconstruction loss against the input.
   **predicted per‑particle poses** (Euler angles + raw 6D rotation), so results can be fed back
   into RELION/cryoSPARC. **Model weights are *not* checkpointed** (see CODE_REVIEW / OPTIMIZATION).
 
-### Experimental scope
-
-The `data*/` folders hold ~90 `.star` files spanning a broad benchmark suite of real and
-simulated specimens: **ribosome** (the dominant test case, 30 kDa–MDa), the **β2‑adrenergic
-receptor** and other GPCRs, **pfCRT**, **TRPV1 / TRPM8** ion channels, **spliceosome**,
-**γ‑secretase**, **apoferritin**, **β‑galactosidase**, **RAG**, **GAT1**, **megabody**,
-**streptavidin**, **glycan**. Box sizes range 64–360 px, with simulated SNR sweeps
-(0.03–0.5). The run‑script history (`oldscripts/run_2025_*.sh … run_2026_0104.sh`) records
-**hundreds of experiments** — this is an actively‑iterated research codebase, not a released tool.
 
 ---
 
-## 2. Method — the forward model, step by step
-
-For one particle image `y` (real space) with known CTF:
-
-```
-                         ┌─────────────────────────── ENCODER (amortised inference) ──────────────────────────┐
-  y (DxD real image) ──► preprocess (multi‑band       Feature_Extractor            Encode_Predictor
-                          low‑pass → N channels)  ──►  (ResNet18 / ConvNeXt / …) ─► 256‑d ─► [ rot6d(6) | latent | shift(2) ]
-                                                                                                     │        │        │
-                                                                                                     ▼        │        ▼
-        x_coord_plane (DxD, z=0 grid) ── rotation_6d_to_matrix(rot6d) ──► rotated central‑slice grid │   translation
-                                                                                     │               │        │
-                                                                                     ▼               ▼        │
-                                          ┌──────────────── DECODER (implicit Fourier volume) ───────┘        │
-                                          │  Fullnet(coords, latent) = exp(net_envelope) · net_modulant       │
-                                          │     each = SIREN MLP, FiLM‑modulated by Modulator(latent)         │
-                                          └──────────────────────────┬──────────────────────────────────────┘│
-                                                                     ▼                                        │
-                              predicted complex Fourier slice ── phase_shift_ft(·, translation) ◄─────────────┘
-                                                                     │
-                                                    × CTF  ── × progressive low‑pass mask ── ÷ noise/dose weights
-                                                                     ▼
-                             loss = symmetric_complex_loss( pred_ft , FT(y) )   (per‑pixel complex L2 in Fourier space)
-```
-
-Key mechanisms that make ab‑initio training converge:
-
-- **Frequency marching (coarse‑to‑fine).** A schedule of concentric Fourier shell masks
-  (`reconstruct_fourier_masks`) grows the active resolution from ~30 Å to ~4–6 Å over the
-  epochs. Early on the network only has to fit low frequencies (robust to noise, few local
-  minima); resolution is admitted gradually.
-
-- **Symmetric multi‑hypothesis pose loss.** Each image is duplicated `sym_factor` times
-  (`image_duplicator`, in‑plane rotated copies); the encoder predicts a pose per copy; the loss
-  keeps the **minimum over the copies** (`symmetric_complex_loss` returns `min_distances,
-  activated_paths`). This is a differentiable branch‑and‑select that mitigates the pose
-  multi‑modality that sinks single‑hypothesis amortised methods.
-
-- **Pose disturbance annealing.** Gaussian/uniform noise is injected into the predicted 6D
-  rotation during early epochs (`add_distrubance`, decayed by `cosine_decay`) to escape bad
-  initial pose basins.
-
-- **Pose‑uniformity regularizer.** `uniform_s2_moment_loss` matches the 1st/2nd moments of the
-  predicted rotation axes to a uniform distribution on S², discouraging orientation collapse.
-
-- **Noise whitening / dose weighting.** Per‑shell weights (`make_shell_weights_midband`,
-  `--DW`) reweight the Fourier loss so mid‑band frequencies are not swamped by low‑frequency
-  power or high‑frequency noise.
-
-- **Heterogeneity.** A latent code from the encoder FiLM‑modulates the decoder SIREN
-  (`Modulator`). `cryoFIFA_Multiclass.py` instead uses a **discrete** latent
-  (softmax→argmax→one‑hot) to reconstruct a fixed number of distinct classes.
-
----
-
-## 3. Architecture components
-
-| Role | Class / file | Notes |
-|------|--------------|-------|
-| **Encoder backbone** | `Feature_Extractor` (`merged_models.py`) | Pluggable: `resnet` (default resnet18), `convnext`, `swin`, `mobile`, `efficient`, `maxvit`, `pdo`, `mlp`. First conv rewired to 1‑or‑N low‑pass channels; classifier → identity → `Naive_MLP → 256‑d`. |
-| **Rotation‑equivariant backbone** | `PDO_eConvs` (`PDO_models.py`) | Steerable p8 group‑CNN (Partial Differential Operator equiv‑convs) selectable as `backbone='pdo'`. |
-| **Pose/latent head** | `Encode_Predictor` (`merged_models.py`) | Three MLP heads → `[rot6d(6), latent, shift(2)]`. |
-| **Decoder (3D Fourier field)** | `Fullnet` → `Homo` → `SirenNet` + `Modulator` (`merged_models.py`) | Output `exp(net_envelope) · net_modulant`: a positive envelope × oscillating modulant, motivated by the exponential‑density ↔ `λ/(λ−it)` Fourier prior. Latent enters via FiLM modulation. |
-| **Pose representation** | 6D continuous rotation (`rotation_6d_to_matrix`, pytorch3d) | Legacy trainer also has quaternion/AF2‑quaternion/Euler/2D options. |
-| **FFT / CTF** | `fourier_utils.py` (`ft2/ift2/ft3/ift3`, `create_ctf`, `phase_shift_ft`) | Centered convention `fftshift∘fftn∘ifftshift`; relativistic CTF in cycles/Å. |
-| **Data** | `new_dataloader.py` (`LmdbDataSet`, `StarDataSet`), `untiled.py` (`Dataloader`, star/MRC IO + LMDB baking) | Hand‑rolled star parser; LMDB is the production path. |
-| **Training toolbox** | `utils.py` (1559 lines), `new_utils.py` | ~250 argparse flags, masks, losses, coordinate grids, frequency schedule, pose‑uniformity loss, CTF. |
-| **Trainer (entry point)** | **`cryofifa_ddpfix.py`** — the single current, usable entry point | torchrun + NCCL DDP, AMP `float16`, per‑model Adam, gradient accumulation, dynamic minibatch sizing, `--fast_ddp`/`--channels_last`/`--grad_checkpoint`, `--coarse_only`, per‑particle `--loss_export`/`--conf_export`. Old trainers (`cryofifa.py`, `kryoAE_trunk.py`, `cryofifa_2026.py`, `cryofifa_back.py`, `cryoFIFA_Multiclass.py`) are archived under `archive/`. |
-| **Reporting / conversion / interpretability** | `experiment_report_generator.py` (PDF of tri‑view slices), `kcs2star.py` (cryoSPARC→star), `cam_module.py` (Grad‑CAM), `dataio.py`/`cryosparc_simulator.py` (synthetic projections), `swd.py` (sliced‑Wasserstein metric). | Mostly peripheral / diagnostic. |
-
----
-
-## 4. How a training run works
+## 2. How a training run works
 
 Runs are launched from a shell script under `experiments/` that `source`s `paths`
 (dataset name → `.star` path map) and calls `torchrun --nproc_per_node 8 ../src/cryofifa_ddpfix.py …`

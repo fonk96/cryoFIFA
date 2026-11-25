@@ -43,7 +43,7 @@ torchrun --nproc_per_node 8 ../src/cryofifa.py \
   --decoder_layers 2 --decoder_hidden_dim 256 --activation SIREN --w0 48 --w 32 \
   --fourier --rotation6d --norm6d --sym --sym_factor 8 \
   --start_resolution 40 --end_resolution 4 --mask_steps 64 --mask_epoch 3 \
-  --num-epochs 50 --minibatch-size 32 --batch_size 32 --float16 --preprocess \
+  --num-epochs 100 --minibatch-size 32 --batch_size 32 --float16 --preprocess \
   --add_distrubance --distrubance_ratio 0.5 --distrubance_epoch 70 --uniform \
   --world_size 8 --free_gpu_memory 8 --render_path results/<run>/
 ```
